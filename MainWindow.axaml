@@ -1,0 +1,139 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:models="clr-namespace:SapTextureTool.Models"
+        x:Class="SapTextureTool.MainWindow"
+        Title="SAP Texture Tool"
+        Width="1000" Height="680"
+        MinWidth="800" MinHeight="520">
+
+  <DockPanel>
+
+    <!-- Top bar: game dir picker -->
+    <Border DockPanel.Dock="Top" Background="#1e1e1e" Padding="10 8">
+      <Grid ColumnDefinitions="Auto,*,Auto,Auto">
+        <TextBlock Grid.Column="0" Text="Game Dir:" VerticalAlignment="Center" Margin="0 0 8 0"/>
+        <TextBox  Grid.Column="1" x:Name="GameDirBox" IsReadOnly="True" VerticalAlignment="Center"/>
+        <Button   Grid.Column="2" Content="Browse" Margin="6 0 0 0" Click="OnBrowseClick"/>
+        <Button   Grid.Column="3" Content="Scan"   Margin="6 0 0 0" Click="OnScanClick"/>
+      </Grid>
+    </Border>
+
+    <!-- Bottom bar: status + actions -->
+    <Border DockPanel.Dock="Bottom" Background="#1a1a1a" Padding="10 8">
+      <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,*,Auto,Auto">
+        <Button Grid.Column="0" Content="Manage Pack"    Margin="0 0 6 0" Click="OnManagePackClick"/>
+        <Button Grid.Column="1" Content="Load Pack"      Margin="0 0 6 0" Click="OnLoadPackClick"/>
+        <Button Grid.Column="2" Content="Apply All"      Margin="0 0 6 0" Click="OnApplyAllClick" Classes="accent"/>
+        <Button Grid.Column="3" Content="Restore Backups" Margin="0 0 6 0" Click="OnRestoreClick"/>
+        <TextBlock Grid.Column="4" x:Name="StatusText" VerticalAlignment="Center"
+                   Foreground="#aaaaaa" Margin="6 0 0 0" TextTrimming="CharacterEllipsis"
+                   Cursor="Hand" PointerPressed="OnStatusClick"
+                   ToolTip.Tip="Click to copy full message"/>
+        <TextBlock Grid.Column="5" x:Name="StagedCount" VerticalAlignment="Center"
+                   Foreground="#66aaff" Margin="6 0 0 0"/>
+        <TextBlock Grid.Column="6" x:Name="PackCount" VerticalAlignment="Center"
+                   Foreground="#66dd88" Margin="6 0 0 0"/>
+      </Grid>
+    </Border>
+
+    <!-- Main split: texture list (left) + preview panels (right) -->
+    <Grid ColumnDefinitions="280,Auto,*">
+
+      <!-- Left: search + list -->
+      <DockPanel Grid.Column="0">
+        <TextBox DockPanel.Dock="Top" x:Name="SearchBox"
+                 Watermark="Search textures..." Margin="6 6 6 4"
+                 TextChanged="OnSearchChanged"/>
+        <ListBox x:Name="TextureList" Margin="6 0 6 6"
+                 SelectionChanged="OnTextureSelected">
+          <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="models:TextureEntry">
+              <Grid ColumnDefinitions="*,Auto" Margin="0 2 0 2">
+                <StackPanel Grid.Column="0" Spacing="1">
+                  <StackPanel Orientation="Horizontal" Spacing="5">
+                    <Border Background="#33446688" CornerRadius="3" Padding="3 1"
+                            IsVisible="{Binding IsAudio}" VerticalAlignment="Center">
+                      <TextBlock Text="♪" FontSize="10" Foreground="#88aaff"/>
+                    </Border>
+                    <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis"
+                               VerticalAlignment="Center"/>
+                  </StackPanel>
+                  <TextBlock Text="{Binding BundleFileName}" FontSize="11"
+                             Foreground="#555" TextTrimming="CharacterEllipsis"/>
+                </StackPanel>
+                <!-- Blue dot: staged but not in pack. Green dot: in pack. -->
+                <Panel Grid.Column="1" Width="10" Margin="6 0 0 0" VerticalAlignment="Center">
+                  <Ellipse Width="8" Height="8" Fill="#66aaff"
+                           IsVisible="{Binding HasReplacementOnly}"
+                           ToolTip.Tip="Staged (not in pack)"/>
+                  <Ellipse Width="8" Height="8" Fill="#66dd88"
+                           IsVisible="{Binding IncludeInPack}"
+                           ToolTip.Tip="In pack"/>
+                </Panel>
+              </Grid>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </DockPanel>
+
+      <!-- Vertical divider -->
+      <GridSplitter Grid.Column="1" Width="4" ResizeDirection="Columns" Background="#333"/>
+
+      <!-- Right: previews -->
+      <Grid Grid.Column="2" RowDefinitions="*,Auto">
+
+        <!-- Side-by-side preview -->
+        <Grid Grid.Row="0" ColumnDefinitions="*,*" Margin="6">
+
+          <!-- Current texture -->
+          <Grid Grid.Column="0" RowDefinitions="Auto,*">
+            <TextBlock Grid.Row="0" Text="Current" HorizontalAlignment="Center"
+                       Foreground="#aaaaaa" Margin="0 4 0 4"/>
+            <Border Grid.Row="1" Background="#111" CornerRadius="4">
+              <Panel>
+                <TextBlock x:Name="CurrentPlaceholder" Text="Select a texture"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Foreground="#555"/>
+                <Image x:Name="CurrentPreview" Stretch="Uniform"
+                       IsVisible="False"/>
+              </Panel>
+            </Border>
+          </Grid>
+
+          <!-- Replacement texture -->
+          <Grid Grid.Column="1" RowDefinitions="Auto,*,Auto" Margin="6 0 0 0">
+            <TextBlock Grid.Row="0" Text="Replacement" HorizontalAlignment="Center"
+                       Foreground="#aaaaaa" Margin="0 4 0 4"/>
+            <Border Grid.Row="1" Background="#111" CornerRadius="4"
+                    DragDrop.AllowDrop="True"
+                    x:Name="ReplacementDropZone">
+              <Panel>
+                <TextBlock x:Name="ReplacementPlaceholder"
+                           Text="Drop PNG here or click Import"
+                           TextWrapping="Wrap" TextAlignment="Center"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Foreground="#555"/>
+                <Image x:Name="ReplacementPreview" Stretch="Uniform"
+                       IsVisible="False"/>
+              </Panel>
+            </Border>
+            <StackPanel Grid.Row="2" Orientation="Horizontal"
+                        HorizontalAlignment="Center" Margin="0 6 0 0">
+              <Button x:Name="ImportButton" Content="Import PNG" Margin="0 0 6 0" Click="OnImportPngClick"/>
+              <Button Content="Clear"         Margin="0 0 6 0" Click="OnClearReplacementClick"/>
+              <Button x:Name="AddToPackButton" Margin="0 0 0 0"
+                      Click="OnToggleInPackClick" IsVisible="False"/>
+            </StackPanel>
+          </Grid>
+        </Grid>
+
+        <!-- Info bar -->
+        <Border Grid.Row="1" Background="#1a1a1a" Padding="10 6">
+          <TextBlock x:Name="TextureInfo" Foreground="#888" FontSize="12"
+                     Text="No texture selected"/>
+        </Border>
+      </Grid>
+    </Grid>
+
+  </DockPanel>
+</Window>

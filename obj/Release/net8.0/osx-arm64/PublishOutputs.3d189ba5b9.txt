@@ -1,0 +1,6 @@
+C:\Users\porte\source\SapTextureTool\publish-mac\SapTextureTool.pdb
+C:\Users\porte\source\SapTextureTool\publish-mac\classdata.tpk
+C:\Users\porte\source\SapTextureTool\publish-mac\libAvaloniaNative.dylib
+C:\Users\porte\source\SapTextureTool\publish-mac\libHarfBuzzSharp.dylib
+C:\Users\porte\source\SapTextureTool\publish-mac\libSkiaSharp.dylib
+C:\Users\porte\source\SapTextureTool\publish-mac\SapTextureTool

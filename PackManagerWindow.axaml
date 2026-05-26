@@ -1,0 +1,112 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:models="clr-namespace:SapTextureTool.Models"
+        x:Class="SapTextureTool.PackManagerWindow"
+        Title="Pack Manager"
+        Width="780" Height="520"
+        MinWidth="520" MinHeight="360">
+
+  <DockPanel>
+
+    <!-- Top: current pack name + version -->
+    <Border DockPanel.Dock="Top" Background="#1e1e1e" Padding="12 10">
+      <Grid ColumnDefinitions="Auto,*,Auto,Auto,*">
+        <TextBlock Grid.Column="0" Text="Name:" VerticalAlignment="Center" Margin="0 0 8 0"/>
+        <TextBox   Grid.Column="1" x:Name="PackNameBox"/>
+        <TextBlock Grid.Column="2" Text="Version:" VerticalAlignment="Center" Margin="12 0 8 0"/>
+        <TextBox   Grid.Column="3" x:Name="VersionBox" Width="70"/>
+        <TextBlock Grid.Column="4" x:Name="CountText"
+                   VerticalAlignment="Center" HorizontalAlignment="Right"
+                   Foreground="#aaaaaa"/>
+      </Grid>
+    </Border>
+
+    <!-- Bottom: action bar -->
+    <Border DockPanel.Dock="Bottom" Background="#1a1a1a" Padding="12 8">
+      <Grid ColumnDefinitions="*,Auto,Auto,Auto">
+        <TextBlock Grid.Column="0" x:Name="StatusText" VerticalAlignment="Center"
+                   Foreground="#aaaaaa" TextTrimming="CharacterEllipsis"/>
+        <Button Grid.Column="1" Content="Add All Staged" Margin="0 0 6 0" Click="OnAddAllStagedClick"/>
+        <Button Grid.Column="2" Content="Load Pack"      Margin="0 0 6 0" Click="OnLoadPackClick"/>
+        <Button Grid.Column="3" Content="Save Pack" Classes="accent"       Click="OnSavePackClick"/>
+      </Grid>
+    </Border>
+
+    <!-- Main body: library (left) + pack contents (right) -->
+    <Grid ColumnDefinitions="210,4,*">
+
+      <!-- Left: saved pack library -->
+      <DockPanel Grid.Column="0">
+        <Border DockPanel.Dock="Top" Background="#181818" Padding="10 6">
+          <TextBlock Text="SAVED PACKS" Foreground="#666" FontSize="11" FontWeight="SemiBold"
+                     LetterSpacing="1"/>
+        </Border>
+
+        <Border DockPanel.Dock="Bottom" Background="#181818" Padding="8 6">
+          <TextBlock x:Name="LibraryEmptyHint"
+                     Text="No packs saved yet.&#10;Save or load a pack to add it here."
+                     Foreground="#444" FontSize="11" TextAlignment="Center"
+                     TextWrapping="Wrap" IsVisible="False"/>
+        </Border>
+
+        <ListBox x:Name="LibraryList"
+                 SelectionChanged="OnLibrarySelectionChanged"
+                 Background="#161616">
+          <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="models:SavedPackRef">
+              <Grid ColumnDefinitions="*,Auto" Margin="0 2">
+                <StackPanel Grid.Column="0" Spacing="1" VerticalAlignment="Center">
+                  <TextBlock Text="{Binding Name}" FontWeight="SemiBold"
+                             TextTrimming="CharacterEllipsis"/>
+                  <TextBlock Text="{Binding Version}" Foreground="#888" FontSize="11"/>
+                </StackPanel>
+                <Button Grid.Column="1" Content="×" Padding="6 2"
+                        VerticalAlignment="Center"
+                        Click="OnRemoveFromLibraryClick"
+                        ToolTip.Tip="Remove from library (does not delete files)"/>
+              </Grid>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </DockPanel>
+
+      <!-- Divider -->
+      <GridSplitter Grid.Column="1" ResizeDirection="Columns" Background="#2a2a2a"/>
+
+      <!-- Right: current pack contents -->
+      <Panel Grid.Column="2">
+        <TextBlock x:Name="EmptyText"
+                   Text="No textures in pack yet.&#10;Select a texture with a replacement and click 'Add to Pack',&#10;or use 'Add All Staged' / 'Load Pack' below."
+                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                   TextAlignment="Center" TextWrapping="Wrap"
+                   Foreground="#555" IsVisible="False"/>
+
+        <ScrollViewer>
+          <ItemsControl x:Name="EntriesList" Margin="4">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="models:PackEntryViewModel">
+                <Border BorderBrush="#2a2a2a" BorderThickness="0 0 0 1" Padding="8 6">
+                  <Grid ColumnDefinitions="72,*,Auto">
+
+                    <Border Grid.Column="0" Background="#111" Width="64" Height="64"
+                            CornerRadius="4" ClipToBounds="True">
+                      <Image Source="{Binding Bitmap}" Stretch="Uniform"/>
+                    </Border>
+
+                    <TextBlock Grid.Column="1" Text="{Binding Entry.Name}"
+                               VerticalAlignment="Center" Margin="12 0"
+                               TextTrimming="CharacterEllipsis"/>
+
+                    <Button Grid.Column="2" Content="Remove"
+                            Click="OnRemoveEntryClick" VerticalAlignment="Center"/>
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
+      </Panel>
+
+    </Grid>
+  </DockPanel>
+</Window>
