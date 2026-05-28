@@ -1,0 +1,18 @@
+# Build output
+bin/
+obj/
+
+# Stray / one-off publish output directories
+/publish/
+/binpublish/
+/publish-mac/
+/publish-mac-x64/
+/publish-mac-arm64/
+
+# Distribution archives (regenerate via build-mac.ps1 / dotnet publish)
+*.zip
+
+# IDE / editor / misc
+.vs/
+*.user
+*.suo

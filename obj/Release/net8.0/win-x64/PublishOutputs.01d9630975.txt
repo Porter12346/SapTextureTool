@@ -1,6 +1,0 @@
-C:\Users\porte\source\SapTextureTool\bin\Release\net8.0\win-x64\publish\SapTextureTool.pdb
-C:\Users\porte\source\SapTextureTool\bin\Release\net8.0\win-x64\publish\classdata.tpk
-C:\Users\porte\source\SapTextureTool\bin\Release\net8.0\win-x64\publish\av_libglesv2.dll
-C:\Users\porte\source\SapTextureTool\bin\Release\net8.0\win-x64\publish\libHarfBuzzSharp.dll
-C:\Users\porte\source\SapTextureTool\bin\Release\net8.0\win-x64\publish\libSkiaSharp.dll
-C:\Users\porte\source\SapTextureTool\bin\Release\net8.0\win-x64\publish\SapTextureTool.exe
