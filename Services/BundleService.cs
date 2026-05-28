@@ -3,6 +3,8 @@ using AssetsTools.NET.Extra;
 using Avalonia.Media.Imaging;
 using BCnEncoder.Decoder;
 using BCnEncoder.Shared;
+using NAudio.Vorbis;
+using NAudio.Wave;
 using SapTextureTool.Models;
 using SkiaSharp;
 using System.IO;
@@ -25,7 +27,18 @@ public static class BundleService
     {
         var candidates = new[]
         {
+            // Windows — game dir is the Steam game folder
             Path.Combine(gameDir, "Super Auto Pets_Data", "StreamingAssets", "aa", "StandaloneWindows64"),
+            // Mac — game dir is the Steam game folder (contains Super Auto Pets.app)
+            Path.Combine(gameDir, "Super Auto Pets.app", "Contents", "Resources", "Data", "StreamingAssets", "aa", "StandaloneOSX"),
+            Path.Combine(gameDir, "Super Auto Pets.app", "Contents", "Resources", "Data", "StreamingAssets", "aa", "StandaloneOSX64"),
+            // Mac — game dir is the .app bundle itself
+            Path.Combine(gameDir, "Contents", "Resources", "Data", "StreamingAssets", "aa", "StandaloneOSX"),
+            Path.Combine(gameDir, "Contents", "Resources", "Data", "StreamingAssets", "aa", "StandaloneOSX64"),
+            // Mac — game dir is the Data folder itself
+            Path.Combine(gameDir, "StreamingAssets", "aa", "StandaloneOSX"),
+            Path.Combine(gameDir, "StreamingAssets", "aa", "StandaloneOSX64"),
+            // Windows fallbacks
             Path.Combine(gameDir, "Contents", "Resources", "Data", "StreamingAssets", "aa", "StandaloneWindows64"),
             Path.Combine(gameDir, "StandaloneWindows64"),
             gameDir,
@@ -33,22 +46,58 @@ public static class BundleService
         foreach (var c in candidates)
             if (Directory.Exists(c) && Directory.GetFiles(c, "*.bundle").Length > 0)
                 return c;
+
+        // Last resort: find any child of a StreamingAssets/aa/ folder that has .bundle files
+        var aaDir = FindDescendantDirectory(gameDir, "aa", maxDepth: 7);
+        if (aaDir != null)
+        {
+            try
+            {
+                foreach (var sub in Directory.GetDirectories(aaDir))
+                    if (Directory.GetFiles(sub, "*.bundle").Length > 0)
+                        return sub;
+            }
+            catch { }
+        }
+
         return candidates[0];
     }
 
-    // Returns the Super Auto Pets_Data directory (contains sharedassets*.assets files).
+    // Returns the directory that contains sharedassets*.assets files.
     public static string GetDataDir(string gameDir)
     {
         var candidates = new[]
         {
+            // Windows
             Path.Combine(gameDir, "Super Auto Pets_Data"),
+            // Mac — game dir is the Steam game folder
+            Path.Combine(gameDir, "Super Auto Pets.app", "Contents", "Resources", "Data"),
+            // Mac — game dir is the .app
             Path.Combine(gameDir, "Contents", "Resources", "Data"),
+            // game dir IS the Data folder
             gameDir,
         };
         foreach (var c in candidates)
             if (Directory.Exists(c) && Directory.GetFiles(c, "*.assets").Length > 0)
                 return c;
         return candidates[0];
+    }
+
+    private static string? FindDescendantDirectory(string root, string name, int maxDepth)
+    {
+        if (maxDepth <= 0) return null;
+        try
+        {
+            foreach (var dir in Directory.GetDirectories(root))
+            {
+                if (Path.GetFileName(dir).Equals(name, StringComparison.OrdinalIgnoreCase))
+                    return dir;
+                var found = FindDescendantDirectory(dir, name, maxDepth - 1);
+                if (found != null) return found;
+            }
+        }
+        catch { }
+        return null;
     }
 
     // ── AssetsManager factory ─────────────────────────────────────────────────
@@ -152,6 +201,17 @@ public static class BundleService
             try
             {
                 var bf = am.GetBaseField(afile, info);
+
+                // Skip stubs: clips with no inline audio data and no streaming resource.
+                // These are metadata-only entries (e.g. in sharedassets*.assets) that the
+                // game loads from elsewhere; we can't read or write them here.
+                var adField = bf["m_AudioData"];
+                var hasInlineData = adField?.IsDummy == false && adField.AsByteArray?.Length > 0;
+                var resField = bf["m_Resource"];
+                var hasStreamedData = resField?.IsDummy == false && resField["m_Size"].AsULong > 0;
+                if (!hasInlineData && !hasStreamedData) continue;
+
+                var bpsField = bf["m_BitsPerSample"];
                 results.Add(new TextureEntry
                 {
                     Kind = AssetKind.Audio,
@@ -164,6 +224,7 @@ public static class BundleService
                     AudioFrequency = bf["m_Frequency"].AsInt,
                     AudioLength = bf["m_Length"].AsFloat,
                     AudioCompressionFormat = bf["m_CompressionFormat"].AsInt,
+                    AudioBitsPerSample = (bpsField?.IsDummy == false && bpsField.AsInt > 0) ? bpsField.AsInt : 16,
                 });
             }
             catch { }
@@ -219,6 +280,125 @@ public static class BundleService
         return (RgbaToAvaloniaBitmap(rgba, entry.Width, entry.Height), null);
     }
 
+    // ── Audio extraction for playback ─────────────────────────────────────────
+
+    public static (byte[]? data, string? error) ExtractAudioBytes(TextureEntry entry)
+    {
+        var am = CreateAssetsManager();
+        try
+        {
+            if (entry.IsBundle)
+            {
+                var bun = am.LoadBundleFile(entry.BundlePath, true);
+                var afile = am.LoadAssetsFileFromBundle(bun, entry.BundleEntryName, false);
+                var info = afile.file.GetAssetInfo(entry.PathId);
+                if (info == null) return (null, "Asset not found");
+                var bf = am.GetBaseField(afile, info);
+                return GetAudioBytesFromBundle(bf, bun);
+            }
+            else
+            {
+                var afile = am.LoadAssetsFile(entry.BundlePath, false);
+                am.LoadClassDatabaseFromPackage(afile.file.Metadata.UnityVersion);
+                var info = afile.file.GetAssetInfo(entry.PathId);
+                if (info == null) return (null, "Asset not found");
+                var bf = am.GetBaseField(afile, info);
+                return GetAudioBytesFromAssetsFile(bf, entry.BundlePath);
+            }
+        }
+        catch (Exception ex) { return (null, ex.Message); }
+        finally { am.UnloadAll(); }
+    }
+
+    private static (byte[]? data, string? error) GetAudioBytesFromBundle(
+        AssetTypeValueField bf, BundleFileInstance bun)
+    {
+        var audioData = bf["m_AudioData"];
+        if (audioData?.IsDummy == false)
+        {
+            var bytes = audioData.AsByteArray;
+            if (bytes != null && bytes.Length > 0) return (bytes, null);
+        }
+
+        var res = bf["m_Resource"];
+        if (res == null || res.IsDummy) return (null, "No audio data");
+
+        var src = res["m_Source"].AsString;
+        var offset = (long)res["m_Offset"].AsULong;
+        var size = (long)res["m_Size"].AsULong;
+
+        if (size == 0) return (null, "Empty resource");
+
+        string entryName;
+        if (string.IsNullOrEmpty(src))
+        {
+            // Streaming clip with blank m_Source — scan for any .resS entry in the bundle
+            var allDirNames = bun.file.BlockAndDirInfo.DirectoryInfos.Select(d => d.Name).ToArray();
+            var found = allDirNames.FirstOrDefault(n => n.EndsWith(".resS", StringComparison.OrdinalIgnoreCase));
+            if (found == null) return (null, "No .resS entry found in bundle");
+            entryName = found;
+        }
+        else
+        {
+            entryName = src.Contains('/') ? src[(src.LastIndexOf('/') + 1)..] : src;
+        }
+
+        var resSIdx = bun.file.GetFileIndex(entryName);
+        if (resSIdx < 0) return (null, $"Bundle entry '{entryName}' not found");
+
+        bun.file.GetFileRange(resSIdx, out var bundleOffset, out _);
+        var reader = bun.file.DataReader;
+        var savedPos = reader.Position;
+        try
+        {
+            reader.Position = bundleOffset + offset;
+            return (reader.ReadBytes((int)size), null);
+        }
+        finally { reader.Position = savedPos; }
+    }
+
+    private static (byte[]? data, string? error) GetAudioBytesFromAssetsFile(
+        AssetTypeValueField bf, string assetsPath)
+    {
+        var audioData = bf["m_AudioData"];
+        if (audioData?.IsDummy == false)
+        {
+            var bytes = audioData.AsByteArray;
+            if (bytes != null && bytes.Length > 0) return (bytes, null);
+        }
+
+        var res = bf["m_Resource"];
+        if (res == null || res.IsDummy) return (null, "No audio data");
+
+        var src = res["m_Source"].AsString;
+        var offset = (long)res["m_Offset"].AsULong;
+        var size = (long)res["m_Size"].AsULong;
+
+        if (size == 0) return (null, "Empty resource");
+
+        var dir = Path.GetDirectoryName(assetsPath) ?? "";
+        string resSName;
+        if (string.IsNullOrEmpty(src))
+        {
+            // Blank m_Source — look for a sibling .resS file next to the .assets file
+            var sibling = Directory.EnumerateFiles(dir, "*.resS").FirstOrDefault();
+            if (sibling == null) return (null, "Streaming audio: no .resS file found alongside assets file");
+            resSName = Path.GetFileName(sibling);
+        }
+        else
+        {
+            resSName = src.Contains('/') ? src[(src.LastIndexOf('/') + 1)..] : src;
+        }
+        var resSPath = Path.Combine(dir, resSName);
+        if (!File.Exists(resSPath)) return (null, $"Resource file not found: {resSName}");
+
+        using var fs = File.OpenRead(resSPath);
+        fs.Seek(offset, SeekOrigin.Begin);
+        var bytes2 = new byte[size];
+        fs.ReadExactly(bytes2);
+        return (bytes2, null);
+    }
+
     public static Bitmap? LoadPngPreview(string pngPath)
     {
         try { return new Bitmap(pngPath); }
@@ -265,7 +445,11 @@ public static class BundleService
                     var fileBytes = File.ReadAllBytes(entry.ReplacementPath);
                     if (entry.Kind == AssetKind.Audio)
                     {
-                        if (!ApplyAudioToField(bf, fileBytes, Path.GetExtension(entry.ReplacementPath))) continue;
+                        var audioData = bf["m_AudioData"];
+                        bool ok = audioData?.IsDummy == false
+                            ? ApplyAudioToField(bf, fileBytes, Path.GetExtension(entry.ReplacementPath))
+                            : ApplyStreamingAudioToBundle(bf, bun, fileBytes, Path.GetExtension(entry.ReplacementPath));
+                        if (!ok) continue;
                         info.SetNewData(bf);
                     }
                     else
@@ -275,7 +459,8 @@ public static class BundleService
                         entry.Width = newW; entry.Height = newH; entry.TextureFormat = 4;
                         info.SetNewData(bf);
                         UpdateSpritesForTexture(am, afile, entry.PathId, newW, newH);
-                        AutoApplyX2(am, afile, entry.Name, fileBytes, explicitNames, progress);
+                        if (!entry.IsAutoX2)
+                            AutoApplyX2(am, afile, entry.Name, fileBytes, explicitNames, progress);
                     }
                 }
                 var dirInfos = bun.file.BlockAndDirInfo.DirectoryInfos;
@@ -287,6 +472,7 @@ public static class BundleService
         }
         finally { am.UnloadAll(); }
         File.Move(tempPath, bundlePath, overwrite: true);
+        PatchCatalogCrc(bundlePath);
     }
 
     private static void PatchAssetsFile(string assetsPath, List<TextureEntry> entries, IProgress<string>? progress)
@@ -308,7 +494,11 @@ public static class BundleService
                 var fileBytes = File.ReadAllBytes(entry.ReplacementPath);
                 if (entry.Kind == AssetKind.Audio)
                 {
-                    if (!ApplyAudioToField(bf, fileBytes, Path.GetExtension(entry.ReplacementPath))) continue;
+                    var audioData = bf["m_AudioData"];
+                    bool ok = audioData?.IsDummy == false
+                        ? ApplyAudioToField(bf, fileBytes, Path.GetExtension(entry.ReplacementPath))
+                        : ApplyStreamingAudioToResS(bf, fileBytes, Path.GetExtension(entry.ReplacementPath), assetsPath);
+                    if (!ok) continue;
                     info.SetNewData(bf);
                 }
                 else
@@ -318,7 +508,8 @@ public static class BundleService
                     entry.Width = newW; entry.Height = newH; entry.TextureFormat = 4;
                     info.SetNewData(bf);
                     UpdateSpritesForTexture(am, afile, entry.PathId, newW, newH);
-                    AutoApplyX2(am, afile, entry.Name, fileBytes, explicitNames, progress);
+                    if (!entry.IsAutoX2)
+                        AutoApplyX2(am, afile, entry.Name, fileBytes, explicitNames, progress);
                 }
             }
             using (var outFs = File.Open(tempPath, FileMode.Create, FileAccess.Write))
@@ -326,6 +517,54 @@ public static class BundleService
         }
         finally { am.UnloadAll(); }
         File.Move(tempPath, assetsPath, overwrite: true);
+    }
+
+    // Finds the bundle's CRC field in catalog.bin (the aa/ sibling directory of the
+    // bundle's platform folder) and zeros it out so Unity skips integrity checking.
+    // Unity treats CRC=0 as "no check". The backup file (.bak) must exist already
+    // because it provides the original file size used to locate the catalog entry.
+    private static void PatchCatalogCrc(string bundlePath)
+    {
+        // catalog.bin lives two levels up: .../aa/<Platform>/<bundle> → .../aa/catalog.bin
+        var platformDir = Path.GetDirectoryName(bundlePath);
+        if (platformDir == null) return;
+        var aaDir = Path.GetDirectoryName(platformDir);
+        if (aaDir == null) return;
+        var catalogPath = Path.Combine(aaDir, "catalog.bin");
+        if (!File.Exists(catalogPath)) return;
+
+        var bakPath = bundlePath + ".bak";
+        if (!File.Exists(bakPath)) return;
+
+        var originalSize = (uint)new FileInfo(bakPath).Length;
+        if (originalSize == 0) return;
+
+        var catalog = File.ReadAllBytes(catalogPath);
+        byte b0 = (byte)(originalSize & 0xFF);
+        byte b1 = (byte)((originalSize >> 8) & 0xFF);
+        byte b2 = (byte)((originalSize >> 16) & 0xFF);
+        byte b3 = (byte)((originalSize >> 24) & 0xFF);
+
+        bool patched = false;
+        for (int i = 4; i < catalog.Length - 8; i++)
+        {
+            if (catalog[i] != b0 || catalog[i+1] != b1 || catalog[i+2] != b2 || catalog[i+3] != b3)
+                continue;
+            // The 4 bytes after the size should be a plausible catalog offset
+            uint nextVal = catalog[i+4] | ((uint)catalog[i+5] << 8) | ((uint)catalog[i+6] << 16) | ((uint)catalog[i+7] << 24);
+            if (nextVal >= (uint)catalog.Length) continue;
+            // Zero out the 4 bytes before the size — that's the CRC field
+            catalog[i-4] = 0; catalog[i-3] = 0; catalog[i-2] = 0; catalog[i-1] = 0;
+            patched = true;
+        }
+
+        if (!patched) return;
+
+        var catalogBak = catalogPath + ".bak";
+        if (!File.Exists(catalogBak))
+            File.Copy(catalogPath, catalogBak);
+
+        File.WriteAllBytes(catalogPath, catalog);
     }
 
     // ── Restore backups ───────────────────────────────────────────────────────
@@ -338,11 +577,30 @@ public static class BundleService
             foreach (var bak in Directory.GetFiles(bundleDir, "*.bundle.bak"))
             { File.Copy(bak, bak[..^4], overwrite: true); File.Delete(bak); }
 
-        // Restore .assets backups
+        // Restore .assets and .resS backups
         var dataDir = GetDataDir(gameDir);
         if (Directory.Exists(dataDir))
+        {
             foreach (var bak in Directory.GetFiles(dataDir, "*.assets.bak"))
-            { File.Copy(bak, bak[..^4], overwrite: true); File.Delete(bak); }
+                { File.Copy(bak, bak[..^4], overwrite: true); File.Delete(bak); }
+            foreach (var bak in Directory.GetFiles(dataDir, "*.resS.bak"))
+                { File.Copy(bak, bak[..^4], overwrite: true); File.Delete(bak); }
+        }
+
+        // Restore catalog.bin backup (catalog CRC zeroing is undone here)
+        if (Directory.Exists(bundleDir))
+        {
+            var aaDir = Path.GetDirectoryName(bundleDir);
+            if (aaDir != null)
+            {
+                var catalogBak = Path.Combine(aaDir, "catalog.bin.bak");
+                if (File.Exists(catalogBak))
+                {
+                    File.Copy(catalogBak, Path.Combine(aaDir, "catalog.bin"), overwrite: true);
+                    File.Delete(catalogBak);
+                }
+            }
+        }
     }
 
     // ── Texture data helpers ──────────────────────────────────────────────────
@@ -474,22 +732,25 @@ public static class BundleService
 
     // ── x2 auto-update ───────────────────────────────────────────────────────
 
-    // After patching a base texture, silently patch the _x2 variant in the same
-    // assets file using the same PNG. Sprite data is intentionally not updated
-    // for x2 — only the Texture2D image needs replacing.
+    // After patching a base texture, also patch a same-file `<name>_2x` variant with the same
+    // PNG. This is a fallback: OnApplyAllClick normally stages _2x counterparts itself (and
+    // handles cross-bundle ones), so this only fires for a same-file _2x that wasn't staged.
+    // It rebuilds the _2x sprite as a quad too, to stay consistent with the base texture.
     private static void AutoApplyX2(
         AssetsManager am, AssetsFileInstance afile,
         string baseName, byte[] pngBytes,
         HashSet<string> explicitNames, IProgress<string>? progress)
     {
         var x2Name = baseName + "_2x";
-        if (explicitNames.Contains(x2Name)) return; // user staged x2 explicitly; don't override
+        if (explicitNames.Contains(x2Name)) return; // already staged (by user or UI auto-_2x); don't double-apply
         var x2Info = FindTextureByName(am, afile, x2Name);
         if (x2Info == null) return;
         progress?.Report($"  Auto-updating {x2Name}...");
         var bf = am.GetBaseField(afile, x2Info);
-        var (ok, _, _) = ApplyPngToField(bf, pngBytes);
-        if (ok) x2Info.SetNewData(bf);
+        var (ok, w, h) = ApplyPngToField(bf, pngBytes);
+        if (!ok) return;
+        x2Info.SetNewData(bf);
+        UpdateSpritesForTexture(am, afile, x2Info.PathId, w, h);
     }
 
     private static AssetFileInfo? FindTextureByName(AssetsManager am, AssetsFileInstance afile, string name)
@@ -504,42 +765,187 @@ public static class BundleService
 
     // ── Audio → AudioClip field ───────────────────────────────────────────────
 
+    private static byte[]? DecodeToPcm(byte[] fileBytes, string ext, out int channels, out int frequency)
+    {
+        channels = 0; frequency = 0;
+        var ms = new MemoryStream(fileBytes);
+        WaveStream reader;
+        try
+        {
+            reader = ext.ToLowerInvariant() switch
+            {
+                ".wav" => new WaveFileReader(ms),
+                ".ogg" => new VorbisWaveReader(ms),
+                ".mp3" => new Mp3FileReader(ms),
+                _ => throw new NotSupportedException(ext),
+            };
+        }
+        catch { ms.Dispose(); return null; }
+
+        using (ms) using (reader)
+        {
+            channels  = reader.WaveFormat.Channels;
+            frequency = reader.WaveFormat.SampleRate;
+            var pcmProvider = reader.ToSampleProvider().ToWaveProvider16();
+            var buf = new MemoryStream();
+            var tmp = new byte[8192];
+            int n;
+            while ((n = pcmProvider.Read(tmp, 0, tmp.Length)) > 0)
+                buf.Write(tmp, 0, n);
+            var pcm = buf.ToArray();
+            return pcm.Length == 0 ? null : pcm;
+        }
+    }
+
+    private static void SetAudioMetadata(AssetTypeValueField bf, int channels, int frequency, int pcmLen)
+    {
+        SetFieldIfPresent(bf, "m_Channels", channels);
+        SetFieldIfPresent(bf, "m_Frequency", frequency);
+        SetFieldIfPresent(bf, "m_BitsPerSample", 16);
+        SetFieldIfPresent(bf, "m_LoadType", 0);
+        SetFieldIfPresent(bf, "m_CompressionFormat", 0);
+        var lenField = bf["m_Length"];
+        if (lenField?.IsDummy == false)
+            lenField.AsFloat = (float)pcmLen / (channels * 2f * frequency);
+    }
+
+    // Inline path: PCM goes directly into m_AudioData. Used for bundle audio clips.
     private static bool ApplyAudioToField(AssetTypeValueField bf, byte[] fileBytes, string ext)
     {
-        byte[] audioBytes;
-        int compressionFormat;
+        var pcm = DecodeToPcm(fileBytes, ext, out int channels, out int frequency);
+        if (pcm == null) return false;
 
-        if (ext.Equals(".wav", StringComparison.OrdinalIgnoreCase))
+        SetAudioMetadata(bf, channels, frequency, pcm.Length);
+
+        var audioData = bf["m_AudioData"];
+        if (audioData?.IsDummy == false)
+            audioData.AsByteArray = pcm;
+
+        var res = bf["m_Resource"];
+        if (res?.IsDummy == false)
         {
-            if (!TryParseWav(fileBytes, out audioBytes, out var ch, out var freq, out var bits))
-                return false;
-            compressionFormat = 0; // PCM
-            SetFieldIfPresent(bf, "m_Channels", ch);
-            SetFieldIfPresent(bf, "m_Frequency", freq);
-            SetFieldIfPresent(bf, "m_BitsPerSample", bits);
-            SetFieldIfPresent(bf, "m_LoadType", 0); // DecompressOnLoad
+            var src = res["m_Source"]; if (src?.IsDummy == false) src.AsString = "";
+            var off = res["m_Offset"]; if (off?.IsDummy == false) off.AsULong = 0;
+            var sz  = res["m_Size"];   if (sz?.IsDummy == false)  sz.AsULong = 0;
+        }
+
+        return true;
+    }
+
+    // Streaming path for bundle audio: PCM is appended to the bundle's internal .resS entry.
+    // Used when m_AudioData is a dummy field — the data lives in a .resS block inside the bundle.
+    private static bool ApplyStreamingAudioToBundle(
+        AssetTypeValueField bf, BundleFileInstance bun, byte[] fileBytes, string ext)
+    {
+        var pcm = DecodeToPcm(fileBytes, ext, out int channels, out int frequency);
+        if (pcm == null) return false;
+
+        var res = bf["m_Resource"];
+        if (res?.IsDummy != false) return false;
+
+        SetAudioMetadata(bf, channels, frequency, pcm.Length);
+
+        // Determine which internal .resS entry to use
+        var srcField = res["m_Source"];
+        var origSrc = srcField?.IsDummy == false ? srcField.AsString : "";
+        string entryName;
+        if (string.IsNullOrEmpty(origSrc))
+        {
+            entryName = bun.file.BlockAndDirInfo.DirectoryInfos
+                .Select(d => d.Name)
+                .FirstOrDefault(n => n.EndsWith(".resS", StringComparison.OrdinalIgnoreCase)) ?? "";
+            if (string.IsNullOrEmpty(entryName)) return false;
         }
         else
         {
-            audioBytes = fileBytes;
-            compressionFormat = ext.Equals(".mp3", StringComparison.OrdinalIgnoreCase) ? 2 : 1; // MP3 or Vorbis
-            SetFieldIfPresent(bf, "m_LoadType", 1); // CompressedInMemory
+            entryName = origSrc.Contains('/') ? origSrc[(origSrc.LastIndexOf('/') + 1)..] : origSrc;
         }
 
-        SetFieldIfPresent(bf, "m_CompressionFormat", compressionFormat);
+        var resSIdx = bun.file.GetFileIndex(entryName);
+        if (resSIdx < 0) return false;
 
-        var audioData = bf["m_AudioData"];
-        if (audioData != null && !audioData.IsDummy)
-            audioData.AsByteArray = audioBytes;
+        // Wrap PCM in WAV so FMOD can determine the audio format
+        var wavMs = new MemoryStream();
+        using (var wfw = new WaveFileWriter(wavMs, new WaveFormat(frequency, 16, channels)))
+            wfw.Write(pcm, 0, pcm.Length);
+        var wavBytes = wavMs.ToArray();
 
-        // Clear streaming resource so Unity reads inline data
-        var res = bf["m_Resource"];
-        if (res != null && !res.IsDummy)
+        // Read the existing .resS block data, append WAV bytes, write back
+        bun.file.GetFileRange(resSIdx, out var bundleOffset, out var entrySize);
+        var reader = bun.file.DataReader;
+        var savedPos = reader.Position;
+        byte[] existing;
+        try
         {
-            var src = res["m_Source"]; if (src != null && !src.IsDummy) src.AsString = "";
-            var off = res["m_Offset"]; if (off != null && !off.IsDummy) off.AsULong = 0;
-            var sz  = res["m_Size"];   if (sz  != null && !sz.IsDummy)  sz.AsULong = 0;
+            reader.Position = bundleOffset;
+            existing = reader.ReadBytes((int)entrySize);
         }
+        finally { reader.Position = savedPos; }
+
+        var wavOffset = (long)existing.Length;
+        var combined = new byte[existing.Length + wavBytes.Length];
+        Buffer.BlockCopy(existing, 0, combined, 0, existing.Length);
+        Buffer.BlockCopy(wavBytes, 0, combined, existing.Length, wavBytes.Length);
+        bun.file.BlockAndDirInfo.DirectoryInfos[resSIdx].SetNewData(combined);
+
+        // Point m_Resource at the appended data
+        if (srcField?.IsDummy == false) srcField.AsString = entryName;
+        var offField = res["m_Offset"]; if (offField?.IsDummy == false) offField.AsULong = (ulong)wavOffset;
+        var szField  = res["m_Size"];   if (szField?.IsDummy  == false) szField.AsULong  = (ulong)wavBytes.Length;
+
+        return true;
+    }
+
+    // Streaming path: PCM is appended to the .resS file; m_Resource is updated to point at it.
+    // Used for standalone .assets clips where m_AudioData is a dummy field (not writable inline).
+    private static bool ApplyStreamingAudioToResS(
+        AssetTypeValueField bf, byte[] fileBytes, string ext, string assetsPath)
+    {
+        var pcm = DecodeToPcm(fileBytes, ext, out int channels, out int frequency);
+        if (pcm == null) return false;
+
+        var res = bf["m_Resource"];
+        if (res?.IsDummy != false) return false;
+
+        SetAudioMetadata(bf, channels, frequency, pcm.Length);
+
+        // Determine which .resS file to use
+        var srcField = res["m_Source"];
+        var origSrc = srcField?.IsDummy == false ? srcField.AsString : "";
+        string resSName;
+        if (!string.IsNullOrEmpty(origSrc))
+        {
+            var slash = origSrc.LastIndexOf('/');
+            resSName = slash >= 0 ? origSrc[(slash + 1)..] : origSrc;
+        }
+        else
+        {
+            resSName = Path.GetFileName(assetsPath) + ".resS";
+        }
+
+        var dir = Path.GetDirectoryName(assetsPath) ?? "";
+        var resSPath = Path.Combine(dir, resSName);
+
+        // Backup .resS alongside the .assets backup (if it exists and isn't already backed up)
+        var resSBak = resSPath + ".bak";
+        if (File.Exists(resSPath) && !File.Exists(resSBak))
+            File.Copy(resSPath, resSBak);
+
+        // Wrap PCM in a WAV container so FMOD can determine the audio format when it reads the file
+        var wavMs = new MemoryStream();
+        using (var wfw = new WaveFileWriter(wavMs, new WaveFormat(frequency, 16, channels)))
+            wfw.Write(pcm, 0, pcm.Length);
+        var wavBytes = wavMs.ToArray();
+
+        // Append WAV at the end of the .resS file (creates it if absent)
+        long offset = File.Exists(resSPath) ? new FileInfo(resSPath).Length : 0;
+        using (var fs = File.Open(resSPath, FileMode.Append, FileAccess.Write))
+            fs.Write(wavBytes);
+
+        // Point m_Resource at the new data
+        if (srcField?.IsDummy == false) srcField.AsString = resSName;
+        var offField = res["m_Offset"]; if (offField?.IsDummy == false) offField.AsULong = (ulong)offset;
+        var szField  = res["m_Size"];   if (szField?.IsDummy  == false) szField.AsULong  = (ulong)wavBytes.Length;
 
         return true;
     }
@@ -548,39 +954,6 @@ public static class BundleService
     {
         var f = bf[name];
         if (f != null && !f.IsDummy) f.AsInt = value;
-    }
-
-    private static bool TryParseWav(byte[] data, out byte[] pcm,
-        out int channels, out int frequency, out int bitsPerSample)
-    {
-        pcm = Array.Empty<byte>();
-        channels = 1; frequency = 44100; bitsPerSample = 16;
-
-        if (data.Length < 44) return false;
-        if (data[0] != 'R' || data[1] != 'I' || data[2] != 'F' || data[3] != 'F') return false;
-        if (data[8] != 'W' || data[9] != 'A' || data[10] != 'V' || data[11] != 'E') return false;
-
-        channels      = BitConverter.ToInt16(data, 22);
-        frequency     = BitConverter.ToInt32(data, 24);
-        bitsPerSample = BitConverter.ToInt16(data, 34);
-
-        // Walk chunks to find "data"
-        var i = 12;
-        while (i + 8 <= data.Length)
-        {
-            var chunkId   = System.Text.Encoding.ASCII.GetString(data, i, 4);
-            var chunkSize = BitConverter.ToInt32(data, i + 4);
-            if (chunkId == "data")
-            {
-                var start = i + 8;
-                var len   = Math.Min(chunkSize, data.Length - start);
-                pcm = new byte[len];
-                Buffer.BlockCopy(data, start, pcm, 0, len);
-                return true;
-            }
-            i += 8 + chunkSize;
-        }
-        return false;
     }
 
     // ── PNG → Texture2D field ─────────────────────────────────────────────────
@@ -610,40 +983,10 @@ public static class BundleService
         return (true, w, h);
     }
 
-    // Finds the Football sprite — exact name preferred, then Football/Soccer substring, then RiceBall.
-    // Football has textureRect {7,2,241,240} which covers ~94% of the 256x256 texture.
-    private static AssetFileInfo? FindFootballSprite(AssetsManager am, AssetsFileInstance afile)
-    {
-        AssetFileInfo? footballSubstr = null;
-        AssetFileInfo? riceball = null;
-        foreach (var s in afile.file.GetAssetsOfType(AssetClassID.Sprite))
-        {
-            try
-            {
-                var n = am.GetBaseField(afile, s)["m_Name"].AsString;
-                if (n.Equals("Football", StringComparison.OrdinalIgnoreCase))
-                    return s; // exact match wins immediately
-                if (footballSubstr == null &&
-                    (n.IndexOf("Football", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     n.IndexOf("Soccer",   StringComparison.OrdinalIgnoreCase) >= 0))
-                    footballSubstr = s;
-                else if (riceball == null && n.IndexOf("RiceBall", StringComparison.OrdinalIgnoreCase) >= 0)
-                    riceball = s;
-            }
-            catch { }
-        }
-        return footballSubstr ?? riceball;
-    }
-
-    // For each Sprite that references texturePathId:
-    //   Clone the football sprite's full field data (which has a working full-coverage mesh),
-    //   swap in the correct name + texture PathID, update the rect for the new size, done.
     private static void UpdateSpritesForTexture(
         AssetsManager am, AssetsFileInstance afile, long texturePathId, int newW, int newH)
     {
-        var footballInfo = FindFootballSprite(am, afile);
-
-        foreach (var spriteInfo in afile.file.GetAssetsOfType(AssetClassID.Sprite))
+        foreach (var spriteInfo in afile.file.GetAssetsOfType(AssetClassID.Sprite).ToList())
         {
             try
             {
@@ -653,59 +996,90 @@ public static class BundleService
                 var texRef = rd["texture"];
                 if (texRef.IsDummy || texRef["m_PathID"].AsLong != texturePathId) continue;
 
-                var spriteName = sbf["m_Name"].AsString;
-
-                // Build the field to write — start from the football clone if available,
-                // otherwise fall back to the sprite's own fields.
-                AssetTypeValueField workBf;
-                if (footballInfo != null)
-                {
-                    // Clone the football exactly — change ONLY name and texture PathID,
-                    // exactly as the user's manual UABEA approach. Touch nothing else.
-                    workBf = am.GetBaseField(afile, footballInfo);
-                    workBf["m_Name"].AsString = spriteName;
-                    var wrd = workBf["m_RD"];
-                    wrd["texture"]["m_PathID"].AsLong = texturePathId;
-                    wrd["texture"]["m_FileID"].AsInt  = 0;
-                }
-                else
-                {
-                    workBf = sbf;
-                    ApplySpriteRect(workBf, newW, newH);
-                }
-
-                spriteInfo.SetNewData(workBf);
+                RebuildSpriteAsQuad(sbf, newW, newH);
+                spriteInfo.SetNewData(sbf);
             }
             catch { }
         }
     }
 
-    private static void ApplySpriteRect(AssetTypeValueField sbf, int newW, int newH)
+    // Replaces a sprite's mesh with a 4-vertex quad that maps the whole texture onto the
+    // sprite's full rect, so an imported image shows completely instead of being clipped to
+    // the original silhouette/sub-rect (the mascot bug).
+    //
+    // SAP sprites bake all-zero vertex UVs; the game derives texture coords as
+    // pixel = position * uvTransform.xz + uvTransform.yw. So the corner positions plus a
+    // matching uvTransform are what make the full image show — baked UVs are written too but
+    // are effectively ignored by the runtime.
+    //
+    // Mesh buffers go through the field API: m_VertexData.m_DataSize is TypelessData (bytes
+    // live on the field itself); m_IndexBuffer is a vector whose bytes live in its "Array" child.
+    private static void RebuildSpriteAsQuad(AssetTypeValueField sbf, int w, int h)
     {
-        sbf["m_Rect"]["x"].AsFloat      = 0;
-        sbf["m_Rect"]["y"].AsFloat      = 0;
-        sbf["m_Rect"]["width"].AsFloat  = newW;
-        sbf["m_Rect"]["height"].AsFloat = newH;
-
         var rd = sbf["m_RD"];
-        rd["textureRect"]["x"].AsFloat      = 0;
-        rd["textureRect"]["y"].AsFloat      = 0;
-        rd["textureRect"]["width"].AsFloat  = newW;
-        rd["textureRect"]["height"].AsFloat = newH;
+        var vd = rd["m_VertexData"];
+        if (vd.IsDummy) return;
 
-        var tro = rd["textureRectOffset"];
-        if (!tro.IsDummy) { tro["x"].AsFloat = 0; tro["y"].AsFloat = 0; }
-        var aro = rd["atlasRectOffset"];
-        if (!aro.IsDummy) { aro["x"].AsFloat = 0; aro["y"].AsFloat = 0; }
+        float px = sbf["m_Pivot"]["x"].AsFloat;
+        float py = sbf["m_Pivot"]["y"].AsFloat;
+        var ppuField = sbf["m_PixelsToUnits"];
+        float ppu = (!ppuField.IsDummy && ppuField.AsFloat > 0) ? ppuField.AsFloat : 100f;
+        float L = -px*w/ppu, R = (1f-px)*w/ppu, B = -py*h/ppu, T = (1f-py)*h/ppu;
 
-        var uvt = rd["uvTransform"];
-        if (!uvt.IsDummy)
+        // Vertex buffer: stream0 = position float3 (4×12=48B); stream1 = uv float2 (4×8=32B)
+        // beginning at the 16-byte-aligned end of stream0 (offset 48). Total 80 bytes.
+        var vb = new byte[80];
+        float[] xs = { L, R, L, R }, ys = { B, B, T, T }, us = { 0, 1, 0, 1 }, vs = { 0, 0, 1, 1 };
+        for (int i = 0; i < 4; i++)
         {
-            uvt["x"].AsFloat = newW;
-            uvt["y"].AsFloat = newW / 2f;
-            uvt["z"].AsFloat = newH;
-            uvt["w"].AsFloat = newH / 2f;
+            BitConverter.GetBytes(xs[i]).CopyTo(vb, i*12);
+            BitConverter.GetBytes(ys[i]).CopyTo(vb, i*12 + 4);
+            BitConverter.GetBytes(us[i]).CopyTo(vb, 48 + i*8);
+            BitConverter.GetBytes(vs[i]).CopyTo(vb, 48 + i*8 + 4);
         }
+        vd["m_VertexCount"].AsInt = 4;
+        vd["m_DataSize"].AsByteArray = vb;
+
+        ushort[] qi = { 0, 1, 2, 2, 1, 3 };
+        var ib = new byte[12];
+        for (int i = 0; i < 6; i++) BitConverter.GetBytes(qi[i]).CopyTo(ib, i*2);
+        ByteArrayField(rd["m_IndexBuffer"]).AsByteArray = ib;
+
+        var smArr = rd["m_SubMeshes"]["Array"];
+        var subMeshes = (smArr != null && !smArr.IsDummy) ? smArr.Children : rd["m_SubMeshes"].Children;
+        if (subMeshes != null && subMeshes.Count > 0)
+        {
+            var sm = subMeshes[0];
+            sm["firstByte"].AsUInt = 0;
+            sm["indexCount"].AsUInt = 6;
+            sm["topology"].AsInt = 0;
+            sm["baseVertex"].AsUInt = 0;
+            sm["firstVertex"].AsUInt = 0;
+            sm["vertexCount"].AsUInt = 4;
+            var aabb = sm["localAABB"];
+            if (!aabb.IsDummy)
+            {
+                aabb["m_Center"]["x"].AsFloat = (L+R)/2f; aabb["m_Center"]["y"].AsFloat = (B+T)/2f; aabb["m_Center"]["z"].AsFloat = 0;
+                aabb["m_Extent"]["x"].AsFloat = (R-L)/2f; aabb["m_Extent"]["y"].AsFloat = (T-B)/2f; aabb["m_Extent"]["z"].AsFloat = 0.001f;
+            }
+        }
+
+        var tr = rd["textureRect"];
+        if (!tr.IsDummy) { tr["x"].AsFloat = 0; tr["y"].AsFloat = 0; tr["width"].AsFloat = w; tr["height"].AsFloat = h; }
+        var tro = rd["textureRectOffset"]; if (!tro.IsDummy) { tro["x"].AsFloat = 0; tro["y"].AsFloat = 0; }
+        var uvt = rd["uvTransform"];
+        if (!uvt.IsDummy) { uvt["x"].AsFloat = ppu; uvt["y"].AsFloat = px*w; uvt["z"].AsFloat = ppu; uvt["w"].AsFloat = py*h; }
+    }
+
+    // Bytes of a TypelessData / vector<byte> field. A plain TypelessData holds the bytes
+    // directly; a vector keeps them in its "Array" child (reading .AsByteArray on the vector
+    // itself throws).
+    private static AssetTypeValueField ByteArrayField(AssetTypeValueField f)
+    {
+        if ((f.Value?.ValueType ?? AssetValueType.None) == AssetValueType.ByteArray) return f;
+        foreach (var c in f.Children)
+            if ((c.Value?.ValueType ?? AssetValueType.None) == AssetValueType.ByteArray) return c;
+        return f["Array"];
     }
 
     // ── Bitmap helpers ────────────────────────────────────────────────────────

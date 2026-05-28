@@ -43,7 +43,10 @@ public static class PackService
     // Returns the number of textures matched.
     public static int ApplyPackToEntries(PackManifest manifest, string packDir, IList<TextureEntry> allEntries)
     {
-        var byName = allEntries.ToDictionary(e => e.Name);
+        // Use TryAdd so duplicate asset names (same name in different bundles) don't throw.
+        var byName = new Dictionary<string, TextureEntry>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in allEntries)
+            byName.TryAdd(e.Name, e);
         var count = 0;
         foreach (var (spriteName, relPath) in manifest.Assets)
         {

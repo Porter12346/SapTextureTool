@@ -41,9 +41,15 @@
 
       <!-- Left: search + list -->
       <DockPanel Grid.Column="0">
-        <TextBox DockPanel.Dock="Top" x:Name="SearchBox"
-                 Watermark="Search textures..." Margin="6 6 6 4"
-                 TextChanged="OnSearchChanged"/>
+        <Grid DockPanel.Dock="Top" ColumnDefinitions="*,Auto" Margin="6 6 6 4">
+          <TextBox Grid.Column="0" x:Name="SearchBox"
+                   Watermark="Search textures..."
+                   TextChanged="OnSearchChanged"/>
+          <CheckBox Grid.Column="1" x:Name="Show2xCheckBox" Content="_2x"
+                    Margin="6 0 0 0" VerticalAlignment="Center"
+                    ToolTip.Tip="Show _2x texture variants"
+                    IsCheckedChanged="OnShow2xChanged"/>
+        </Grid>
         <ListBox x:Name="TextureList" Margin="6 0 6 6"
                  SelectionChanged="OnTextureSelected">
           <ListBox.ItemTemplate>
@@ -86,7 +92,7 @@
         <Grid Grid.Row="0" ColumnDefinitions="*,*" Margin="6">
 
           <!-- Current texture -->
-          <Grid Grid.Column="0" RowDefinitions="Auto,*">
+          <Grid Grid.Column="0" RowDefinitions="Auto,*,Auto">
             <TextBlock Grid.Row="0" Text="Current" HorizontalAlignment="Center"
                        Foreground="#aaaaaa" Margin="0 4 0 4"/>
             <Border Grid.Row="1" Background="#111" CornerRadius="4">
@@ -98,6 +104,9 @@
                        IsVisible="False"/>
               </Panel>
             </Border>
+            <Button Grid.Row="2" x:Name="PlayCurrentButton" Content="▶ Play"
+                    HorizontalAlignment="Center" Margin="0 6 0 0"
+                    IsVisible="False" Click="OnPlayCurrentClick"/>
           </Grid>
 
           <!-- Replacement texture -->
@@ -120,6 +129,8 @@
             <StackPanel Grid.Row="2" Orientation="Horizontal"
                         HorizontalAlignment="Center" Margin="0 6 0 0">
               <Button x:Name="ImportButton" Content="Import PNG" Margin="0 0 6 0" Click="OnImportPngClick"/>
+              <Button x:Name="PlayReplacementButton" Content="▶ Play"
+                      Margin="0 0 6 0" IsVisible="False" Click="OnPlayReplacementClick"/>
               <Button Content="Clear"         Margin="0 0 6 0" Click="OnClearReplacementClick"/>
               <Button x:Name="AddToPackButton" Margin="0 0 0 0"
                       Click="OnToggleInPackClick" IsVisible="False"/>

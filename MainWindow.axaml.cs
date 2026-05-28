@@ -4,6 +4,9 @@ using Avalonia.Interactivity;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
+using Fmod5Sharp;
+using NAudio.Vorbis;
+using NAudio.Wave;
 using SapTextureTool.Models;
 using SapTextureTool.Services;
 using System.Collections.ObjectModel;
@@ -30,6 +33,7 @@ public partial class MainWindow : Window
 
         LoadSavedState();
         this.Opened += (_, _) => OnScanClick(null, null!);
+        this.Closing += (_, _) => StopPlayback();
     }
 
     private void LoadSavedState()
@@ -77,13 +81,17 @@ public partial class MainWindow : Window
     private void OnSearchChanged(object? sender, TextChangedEventArgs e) =>
         ApplyFilter(SearchBox.Text ?? "");
 
+    private void OnShow2xChanged(object? sender, RoutedEventArgs e) =>
+        ApplyFilter(SearchBox.Text ?? "");
+
     private void ApplyFilter(string term)
     {
         _filteredEntries.Clear();
         var lower = term.Trim().ToLowerInvariant();
+        var show2x = Show2xCheckBox.IsChecked == true;
         foreach (var entry in _allEntries)
         {
-            if (!entry.IsAudio && entry.Name.EndsWith("_2x", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!show2x && !entry.IsAudio && entry.Name.EndsWith("_2x", StringComparison.OrdinalIgnoreCase)) continue;
             if (lower.Length == 0 || entry.Name.ToLowerInvariant().Contains(lower))
                 _filteredEntries.Add(entry);
         }
@@ -140,7 +148,9 @@ public partial class MainWindow : Window
                 ClearReplacementPreviewUi();
         }
 
+        StopPlayback();
         UpdateAddToPackButton();
+        UpdatePlayButtons();
     }
 
     private static string AudioFormatName(int fmt) => fmt switch
@@ -183,10 +193,12 @@ public partial class MainWindow : Window
     private void OnClearReplacementClick(object? sender, RoutedEventArgs e)
     {
         if (_selected == null) return;
+        StopPlayback();
         _selected.ReplacementPath = null;
         ClearReplacementPreviewUi();
         UpdateStagedCount();
         UpdateAddToPackButton();
+        UpdatePlayButtons();
     }
 
     private void OnReplacementDragOver(object? sender, DragEventArgs e)
@@ -225,6 +237,7 @@ public partial class MainWindow : Window
             ShowReplacementPreview(BundleService.LoadPngPreview(filePath));
         UpdateStagedCount();
         UpdateAddToPackButton();
+        UpdatePlayButtons();
     }
 
     private void ShowAudioReplacementInfo(string path)
@@ -267,16 +280,48 @@ public partial class MainWindow : Window
         var staged = _allEntries.Where(x => x.HasReplacement).ToList();
         if (staged.Count == 0) { SetStatus("Nothing staged."); return; }
 
-        SetStatus("Applying replacements...");
+        // Auto-find _2x counterparts for staged textures that aren't already staged.
+        // These may live in a different bundle from the base texture, so we can't rely
+        // on AutoApplyX2 (which only searches the current bundle CAB entry).
+        var stagedNames = new HashSet<string>(staged.Select(e => e.Name), StringComparer.OrdinalIgnoreCase);
+        var autoX2 = new List<TextureEntry>();
+        var addedX2 = new HashSet<TextureEntry>();
+        foreach (var entry in staged.Where(e => e.Kind == AssetKind.Texture))
+        {
+            var x2Name = entry.Name + "_2x";
+            if (stagedNames.Contains(x2Name)) continue;
+            foreach (var x2 in _allEntries.Where(e =>
+                e.Kind == AssetKind.Texture &&
+                e.Name.Equals(x2Name, StringComparison.OrdinalIgnoreCase)))
+            {
+                if (!addedX2.Add(x2)) continue;
+                x2.ReplacementPath = entry.ReplacementPath;
+                x2.IsAutoX2 = true;
+                autoX2.Add(x2);
+            }
+        }
+
+        var allToApply = staged.Concat(autoX2).ToList();
+        SetStatus(autoX2.Count > 0
+            ? $"Applying {staged.Count} replacement(s) + {autoX2.Count} auto-_2x ({string.Join(", ", autoX2.Select(x => x.Name))})..."
+            : "Applying replacements (no _2x counterparts found)...");
         try
         {
-            await Task.Run(() => BundleService.ApplyReplacements(staged, new Progress<string>(msg =>
+            await Task.Run(() => BundleService.ApplyReplacements(allToApply, new Progress<string>(msg =>
                 Dispatcher.UIThread.Post(() => SetStatus(msg)))));
             SetStatus($"Applied {staged.Count} replacement(s). Restart SAP to see changes.");
         }
         catch (Exception ex)
         {
             SetStatus($"Error: {ex.Message}");
+        }
+        finally
+        {
+            foreach (var x2 in autoX2)
+            {
+                x2.ReplacementPath = null;
+                x2.IsAutoX2 = false;
+            }
         }
     }
 
@@ -326,7 +371,17 @@ public partial class MainWindow : Window
 
         foreach (var entry in _allEntries) { entry.IncludeInPack = false; entry.ReplacementPath = null; }
 
-        var count = PackService.ApplyPackToEntries(manifest, packDir, _allEntries);
+        int count;
+        try
+        {
+            count = PackService.ApplyPackToEntries(manifest, packDir, _allEntries);
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Error loading pack: {ex.Message}");
+            return;
+        }
+
         _activePackDir = packDir;
         _activePackName = manifest.Name;
         PackService.AddOrUpdateInLibrary(new SapTextureTool.Models.SavedPackRef
@@ -357,6 +412,137 @@ public partial class MainWindow : Window
         {
             AddToPackButton.IsVisible = false;
         }
+    }
+
+    // ── Audio playback ────────────────────────────────────────────────────────
+
+    private IWavePlayer? _wavePlayer;
+    private WaveStream? _waveStream;
+    private MemoryStream? _audioMemStream;
+    private string _playingWhich = "";
+
+    private async void OnPlayCurrentClick(object? sender, RoutedEventArgs e)
+    {
+        if (_wavePlayer?.PlaybackState == PlaybackState.Playing && _playingWhich == "current")
+        { StopPlayback(); return; }
+
+        StopPlayback();
+        if (_selected == null || !_selected.IsAudio) return;
+
+        SetStatus("Loading audio...");
+        var entry = _selected;
+        var (data, err) = await Task.Run(() => BundleService.ExtractAudioBytes(entry));
+        if (data == null) { SetStatus($"Audio error: {err}"); return; }
+        SetStatus("");
+
+        try
+        {
+            var playData = UnwrapFsb5IfNeeded(data);
+            _audioMemStream = new MemoryStream(playData);
+            _waveStream = DetectAudioFormat(playData, _audioMemStream, entry);
+            BeginPlayback("current");
+        }
+        catch (Exception ex) { SetStatus($"Playback error: {ex.Message}"); StopPlayback(); }
+    }
+
+    private void OnPlayReplacementClick(object? sender, RoutedEventArgs e)
+    {
+        if (_wavePlayer?.PlaybackState == PlaybackState.Playing && _playingWhich == "replacement")
+        { StopPlayback(); return; }
+
+        StopPlayback();
+        if (_selected?.ReplacementPath == null) return;
+
+        try
+        {
+            var ext = Path.GetExtension(_selected.ReplacementPath).ToLowerInvariant();
+            _waveStream = ext switch
+            {
+                ".wav" => new WaveFileReader(_selected.ReplacementPath),
+                ".ogg" => new VorbisWaveReader(_selected.ReplacementPath),
+                ".mp3" => new Mp3FileReader(_selected.ReplacementPath),
+                _ => throw new NotSupportedException($"Format {ext} not supported"),
+            };
+            BeginPlayback("replacement");
+        }
+        catch (Exception ex) { SetStatus($"Playback error: {ex.Message}"); StopPlayback(); }
+    }
+
+    private static byte[] UnwrapFsb5IfNeeded(byte[] data)
+    {
+        if (data.Length < 4 || data[0]!='F' || data[1]!='S' || data[2]!='B' || data[3]!='5')
+            return data;
+
+        if (!FsbLoader.TryLoadFsbFromByteArray(data, out var bank) || bank == null || bank.Samples.Count == 0)
+            throw new NotSupportedException("FSB5 container could not be parsed");
+
+        var sample = bank.Samples[0];
+        if (!sample.RebuildAsStandardFileFormat(out var rebuilt, out _) || rebuilt == null)
+            throw new NotSupportedException("FSB5 audio format could not be rebuilt (unsupported codec)");
+
+        return rebuilt;
+    }
+
+    private WaveStream DetectAudioFormat(byte[] data, Stream stream, TextureEntry entry)
+    {
+        if (data.Length >= 4)
+        {
+            // OGG Vorbis
+            if (data[0] == 'O' && data[1] == 'g' && data[2] == 'g' && data[3] == 'S')
+                return new VorbisWaveReader(stream);
+            // RIFF WAV
+            if (data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F')
+                return new WaveFileReader(stream);
+            // MP3 (ID3 tag or sync word)
+            if ((data[0] == 'I' && data[1] == 'D' && data[2] == '3') ||
+                (data[0] == 0xFF && (data[1] & 0xE0) == 0xE0))
+                return new Mp3FileReader(stream);
+        }
+        // Raw PCM fallback
+        return new RawSourceWaveStream(stream,
+            new WaveFormat(entry.AudioFrequency, entry.AudioBitsPerSample, entry.AudioChannels));
+    }
+
+    private void BeginPlayback(string which)
+    {
+        _playingWhich = which;
+        try { _wavePlayer = new WaveOutEvent(); }
+        catch
+        {
+            SetStatus("Audio preview is not supported on this platform. Replacement still works — restart the game to hear changes.");
+            _waveStream?.Dispose(); _waveStream = null;
+            return;
+        }
+        _wavePlayer.Init(_waveStream!);
+        _wavePlayer.PlaybackStopped += (_, _) =>
+            Dispatcher.UIThread.Post(() => { _wavePlayer = null; ResetPlayButtons(); });
+        _wavePlayer.Play();
+        if (which == "current") PlayCurrentButton.Content = "■ Stop";
+        else PlayReplacementButton.Content = "■ Stop";
+    }
+
+    private void StopPlayback()
+    {
+        _wavePlayer?.Stop();
+        _wavePlayer?.Dispose();
+        _wavePlayer = null;
+        _waveStream?.Dispose();
+        _waveStream = null;
+        _audioMemStream?.Dispose();
+        _audioMemStream = null;
+        ResetPlayButtons();
+    }
+
+    private void ResetPlayButtons()
+    {
+        PlayCurrentButton.Content = "▶ Play";
+        PlayReplacementButton.Content = "▶ Play";
+    }
+
+    private void UpdatePlayButtons()
+    {
+        PlayCurrentButton.IsVisible = _selected?.IsAudio == true;
+        PlayReplacementButton.IsVisible = _selected?.IsAudio == true && _selected.HasReplacement;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

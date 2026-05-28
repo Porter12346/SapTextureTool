@@ -24,6 +24,7 @@ public class TextureEntry : INotifyPropertyChanged
     public int AudioFrequency { get; init; }
     public float AudioLength { get; init; }
     public int AudioCompressionFormat { get; init; }
+    public int AudioBitsPerSample { get; init; } = 16;
 
     public bool IsAudio => Kind == AssetKind.Audio;
     public string BundleFileName => System.IO.Path.GetFileName(BundlePath);
@@ -54,6 +55,11 @@ public class TextureEntry : INotifyPropertyChanged
             OnPropertyChanged(nameof(HasReplacementOnly));
         }
     }
+
+    // Set by OnApplyAllClick for cross-bundle _2x auto-replacements (the _2x gets the same PNG).
+    // Gates ONLY the recursive in-file AutoApplyX2 call — it does NOT skip UpdateSpritesForTexture,
+    // which still runs so the _2x sprite is rebuilt as a quad just like its base texture.
+    public bool IsAutoX2 { get; set; }
 
     public bool HasReplacement => _replacementPath != null;
     public bool HasReplacementOnly => HasReplacement && !_includeInPack;
