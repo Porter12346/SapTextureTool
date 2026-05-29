@@ -3,6 +3,7 @@
         xmlns:models="clr-namespace:SapTextureTool.Models"
         x:Class="SapTextureTool.PackManagerWindow"
         Title="Pack Manager"
+        Icon="avares://SapTextureTool/Assets/icon.png"
         Width="780" Height="520"
         MinWidth="520" MinHeight="360">
 

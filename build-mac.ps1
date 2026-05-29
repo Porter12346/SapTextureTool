@@ -24,6 +24,8 @@ $InfoPlist = @"
     <string>1.0</string>
     <key>CFBundleExecutable</key>
     <string>$AppName</string>
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>NSHighResolutionCapable</key>
@@ -131,6 +133,12 @@ foreach ($arch in $Arch) {
     # Copy all published files except .pdb into Contents/MacOS/
     Get-ChildItem $publishDir -File | Where-Object Extension -ne ".pdb" |
         Copy-Item -Destination $macosDir
+
+    # Drop the .app icon into Contents/Resources/icon.icns (Info.plist's CFBundleIconFile
+    # references "icon" — macOS appends .icns automatically).
+    $resourcesDir = "$appBundle\Contents\Resources"
+    New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
+    Copy-Item "Assets\icon.icns" "$resourcesDir\icon.icns" -Force
 
     # Write Info.plist
     [System.IO.File]::WriteAllText("$appBundle\Contents\Info.plist", $InfoPlist, [System.Text.Encoding]::UTF8)
