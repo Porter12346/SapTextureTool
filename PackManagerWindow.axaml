@@ -54,13 +54,17 @@
                  Background="#161616">
           <ListBox.ItemTemplate>
             <DataTemplate x:DataType="models:SavedPackRef">
-              <Grid ColumnDefinitions="*,Auto" Margin="0 2">
+              <Grid ColumnDefinitions="*,Auto,Auto" Margin="0 2">
                 <StackPanel Grid.Column="0" Spacing="1" VerticalAlignment="Center">
                   <TextBlock Text="{Binding Name}" FontWeight="SemiBold"
                              TextTrimming="CharacterEllipsis"/>
                   <TextBlock Text="{Binding Version}" Foreground="#888" FontSize="11"/>
                 </StackPanel>
-                <Button Grid.Column="1" Content="×" Padding="6 2"
+                <Button Grid.Column="1" Content="Activate" Padding="6 2" Margin="0 0 4 0"
+                        VerticalAlignment="Center" Classes="accent"
+                        Click="OnActivatePackClick"
+                        ToolTip.Tip="Restore all bundles to backup, then apply only this pack's textures."/>
+                <Button Grid.Column="2" Content="×" Padding="6 2"
                         VerticalAlignment="Center"
                         Click="OnRemoveFromLibraryClick"
                         ToolTip.Tip="Remove from library (does not delete files)"/>
@@ -90,7 +94,13 @@
 
                     <Border Grid.Column="0" Background="#111" Width="64" Height="64"
                             CornerRadius="4" ClipToBounds="True">
-                      <Image Source="{Binding Bitmap}" Stretch="Uniform"/>
+                      <Panel>
+                        <Image Source="{Binding Bitmap}" Stretch="Uniform"
+                               IsVisible="{Binding !Entry.IsAudio}"/>
+                        <TextBlock Text="♪" FontSize="32" Foreground="#88aaff"
+                                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                                   IsVisible="{Binding Entry.IsAudio}"/>
+                      </Panel>
                     </Border>
 
                     <TextBlock Grid.Column="1" Text="{Binding Entry.Name}"

@@ -29,6 +29,9 @@ public class TextureEntry : INotifyPropertyChanged
     public bool IsAudio => Kind == AssetKind.Audio;
     public string BundleFileName => System.IO.Path.GetFileName(BundlePath);
 
+    // "<bundleFileName>#<pathId>" — used to disambiguate same-Name duplicates in packs.
+    public string SourceTag => $"{BundleFileName}#{PathId}";
+
     private string? _replacementPath;
     public string? ReplacementPath
     {
@@ -36,11 +39,18 @@ public class TextureEntry : INotifyPropertyChanged
         set
         {
             _replacementPath = value;
-            if (value == null) _includeInPack = false;
+            if (value == null)
+            {
+                _includeInPack = false;
+                _originalReplacementPath = null;
+                _border = null;
+            }
             OnPropertyChanged();
             OnPropertyChanged(nameof(HasReplacement));
             OnPropertyChanged(nameof(HasReplacementOnly));
             OnPropertyChanged(nameof(IncludeInPack));
+            OnPropertyChanged(nameof(Border));
+            OnPropertyChanged(nameof(OriginalReplacementPath));
         }
     }
 
@@ -60,6 +70,39 @@ public class TextureEntry : INotifyPropertyChanged
     // Gates ONLY the recursive in-file AutoApplyX2 call — it does NOT skip UpdateSpritesForTexture,
     // which still runs so the _2x sprite is rebuilt as a quad just like its base texture.
     public bool IsAutoX2 { get; set; }
+
+    // Border tool state. When Border is non-null, ReplacementPath points to a cached bordered PNG
+    // and OriginalReplacementPath holds the user's original (pre-border) PNG path.
+    private string? _originalReplacementPath;
+    public string? OriginalReplacementPath
+    {
+        get => _originalReplacementPath;
+        set { _originalReplacementPath = value; OnPropertyChanged(); }
+    }
+
+    private BorderConfig? _border;
+    public BorderConfig? Border
+    {
+        get => _border;
+        set { _border = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasBorder)); }
+    }
+    public bool HasBorder => _border != null;
+
+    // Duplicate-group metadata. Set after scan: 1-based index within the group, total group size.
+    private int _duplicateIndex;
+    public int DuplicateIndex
+    {
+        get => _duplicateIndex;
+        set { _duplicateIndex = value; OnPropertyChanged(); OnPropertyChanged(nameof(DuplicateLabel)); OnPropertyChanged(nameof(IsDuplicate)); }
+    }
+    private int _duplicateCount;
+    public int DuplicateCount
+    {
+        get => _duplicateCount;
+        set { _duplicateCount = value; OnPropertyChanged(); OnPropertyChanged(nameof(DuplicateLabel)); OnPropertyChanged(nameof(IsDuplicate)); }
+    }
+    public bool IsDuplicate => _duplicateCount > 1;
+    public string DuplicateLabel => _duplicateCount > 1 ? $"{_duplicateIndex}/{_duplicateCount}" : "";
 
     public bool HasReplacement => _replacementPath != null;
     public bool HasReplacementOnly => HasReplacement && !_includeInPack;

@@ -1,6 +1,7 @@
 using Avalonia.Controls;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
+using Avalonia.Threading;
 using SapTextureTool.Models;
 using SapTextureTool.Services;
 using System.Collections.ObjectModel;
@@ -11,6 +12,8 @@ namespace SapTextureTool;
 public partial class PackManagerWindow : Window
 {
     private readonly IList<TextureEntry> _allEntries;
+    private readonly Dictionary<string, PackDraft> _drafts;
+    private readonly string _gameDir;
     private readonly ObservableCollection<PackEntryViewModel> _items = new();
     private readonly ObservableCollection<SavedPackRef> _library = new();
     private bool _blockSwap;
@@ -18,18 +21,24 @@ public partial class PackManagerWindow : Window
     // Read by MainWindow after ShowDialog to sync active pack state.
     public string? ActivePackDir { get; private set; }
     public string? ActivePackName { get; private set; }
+    public string? ActivePackVersion { get; private set; }
 
-    public PackManagerWindow(IList<TextureEntry> allEntries, string? activePackDir = null)
+    public PackManagerWindow(IList<TextureEntry> allEntries, Dictionary<string, PackDraft> drafts,
+        string? activePackDir, string? activePackName, string? activePackVersion, string gameDir)
     {
         InitializeComponent();
         _allEntries = allEntries;
+        _drafts = drafts;
+        _gameDir = gameDir;
         ActivePackDir = activePackDir;
+        ActivePackName = activePackName;
+        ActivePackVersion = activePackVersion;
 
         EntriesList.ItemsSource = _items;
         LibraryList.ItemsSource = _library;
 
-        PackNameBox.Text = "MySapPack";
-        VersionBox.Text = "1.0";
+        PackNameBox.Text = activePackName ?? "MySapPack";
+        VersionBox.Text = activePackVersion ?? "1.0";
 
         LoadLibrary(activePackDir);
         RefreshPackList();
@@ -75,10 +84,16 @@ public partial class PackManagerWindow : Window
         PackService.SavePackLibrary(_library.ToList());
         LibraryEmptyHint.IsVisible = _library.Count == 0;
 
+        // Removing from the library also drops the draft — orphan drafts would clutter the
+        // Add-to-Pack picker forever.
+        if (_drafts.Remove(packRef.PackDir))
+            DraftService.Save(_drafts);
+
         if (ActivePackDir == packRef.PackDir)
         {
             ActivePackDir = null;
             ActivePackName = null;
+            ActivePackVersion = null;
             LibraryList.SelectedItem = null;
         }
         else
@@ -90,28 +105,113 @@ public partial class PackManagerWindow : Window
         StatusText.Text = $"Removed '{packRef.Name}' from library.";
     }
 
+    // Restores every bundle to backup state, then applies only this pack's textures.
+    // After the operation the named pack is the sole modded content in the game.
+    private async void OnActivatePackClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Button btn || btn.DataContext is not SavedPackRef packRef) return;
+
+        // Snapshot the outgoing pack's unsaved state before we switch to the target.
+        PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+        DraftService.Save(_drafts);
+
+        // Load the target pack into entries — draft is preferred over disk if it exists.
+        ClearAllReplacements();
+        int count;
+        string name, version;
+        if (_drafts.TryGetValue(packRef.PackDir, out var draft))
+        {
+            count = PackService.ApplyDraftToEntries(draft, _allEntries);
+            name = draft.Name;
+            version = draft.Version;
+        }
+        else
+        {
+            var packJsonPath = Path.Combine(packRef.PackDir, "pack.json");
+            var result = PackService.LoadPack(packJsonPath);
+            if (result == null) { StatusText.Text = $"Could not read pack at {packRef.PackDir}"; return; }
+            var (manifest, packDir) = result.Value;
+            count = PackService.ApplyPackToEntries(manifest, packDir, _allEntries);
+            name = manifest.Name;
+            version = manifest.Version;
+        }
+
+        PackNameBox.Text = name;
+        VersionBox.Text = version;
+        ActivePackDir = packRef.PackDir;
+        ActivePackName = name;
+        ActivePackVersion = version;
+        PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+        DraftService.Save(_drafts);
+        RefreshPackList();
+        _ = LoadBitmapsAsync();
+
+        var entriesToApply = _allEntries
+            .Where(en => en.IncludeInPack && en.HasReplacement)
+            .ToList();
+
+        StatusText.Text = $"Activating '{name}': restoring backups...";
+        try
+        {
+            Logger.Info($"Activate pack: '{name}' ({entriesToApply.Count} entries)");
+            await Task.Run(() => BundleService.RestoreBackups(_gameDir));
+            StatusText.Text = $"Activating '{name}': applying {entriesToApply.Count} texture(s)...";
+            await Task.Run(() => BundleService.ApplyReplacements(entriesToApply,
+                new Progress<string>(msg => Dispatcher.UIThread.Post(() => StatusText.Text = msg))));
+            StatusText.Text = $"Activated '{name}' — restart SAP to see changes.";
+            Logger.Info($"Activate pack done: '{name}'");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Activate pack failed", ex);
+            StatusText.Text = $"Activate error: {ex.Message}";
+        }
+    }
+
     private void SwapToPack(SavedPackRef packRef)
     {
-        var packJsonPath = Path.Combine(packRef.PackDir, "pack.json");
-        var result = PackService.LoadPack(packJsonPath);
-        if (result == null)
-        {
-            StatusText.Text = $"Could not read pack at {packRef.PackDir}";
-            return;
-        }
+        // Snapshot the outgoing pack into its draft so unsaved changes survive the swap.
+        PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+        DraftService.Save(_drafts);
 
         ClearAllReplacements();
 
-        var (manifest, packDir) = result.Value;
-        PackNameBox.Text = manifest.Name;
-        VersionBox.Text = manifest.Version;
-        ActivePackDir = packRef.PackDir;
-        ActivePackName = manifest.Name;
+        // Prefer a draft when we have one — it carries any unsaved state. Fall back to disk.
+        int count;
+        string name, version;
+        if (_drafts.TryGetValue(packRef.PackDir, out var draft))
+        {
+            count = PackService.ApplyDraftToEntries(draft, _allEntries);
+            name = draft.Name;
+            version = draft.Version;
+        }
+        else
+        {
+            var packJsonPath = Path.Combine(packRef.PackDir, "pack.json");
+            var result = PackService.LoadPack(packJsonPath);
+            if (result == null)
+            {
+                StatusText.Text = $"Could not read pack at {packRef.PackDir}";
+                return;
+            }
+            var (manifest, packDir) = result.Value;
+            count = PackService.ApplyPackToEntries(manifest, packDir, _allEntries);
+            name = manifest.Name;
+            version = manifest.Version;
+        }
 
-        var count = PackService.ApplyPackToEntries(manifest, packDir, _allEntries);
+        PackNameBox.Text = name;
+        VersionBox.Text = version;
+        ActivePackDir = packRef.PackDir;
+        ActivePackName = name;
+        ActivePackVersion = version;
+        // Ensure the new active pack has a draft for future Add-to-Pack picker visibility.
+        PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+        DraftService.Save(_drafts);
+
         RefreshPackList();
         _ = LoadBitmapsAsync();
-        StatusText.Text = $"Swapped to '{manifest.Name}' — {count} texture(s) loaded.";
+        StatusText.Text = $"Swapped to '{name}' — {count} texture(s) loaded.";
     }
 
     // ── Pack contents ─────────────────────────────────────────────────────────
@@ -130,6 +230,7 @@ public partial class PackManagerWindow : Window
     {
         foreach (var vm in _items.ToList())
         {
+            if (vm.Entry.IsAudio) continue;
             if (vm.Entry.ReplacementPath != null)
                 vm.Bitmap = await Task.Run(() => BundleService.LoadPngPreview(vm.Entry.ReplacementPath));
         }
@@ -152,6 +253,8 @@ public partial class PackManagerWindow : Window
         var n = _items.Count;
         CountText.Text = $"{n} texture{(n == 1 ? "" : "s")} in pack";
         EmptyText.IsVisible = n == 0;
+        PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+        DraftService.Save(_drafts);
     }
 
     private void OnAddAllStagedClick(object? sender, RoutedEventArgs e)
@@ -163,7 +266,13 @@ public partial class PackManagerWindow : Window
             added++;
         }
         RefreshPackList();
-        if (added > 0) _ = LoadBitmapsAsync();
+        if (added > 0)
+        {
+            _ = LoadBitmapsAsync();
+            // Sync the bulk additions into the active pack's draft.
+            PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+            DraftService.Save(_drafts);
+        }
         StatusText.Text = added > 0 ? $"Added {added} staged texture(s) to pack." : "No new staged textures to add.";
     }
 
@@ -189,6 +298,11 @@ public partial class PackManagerWindow : Window
         var packRef = UpsertInLibrary(name, version, outDir);
         ActivePackDir = outDir;
         ActivePackName = name;
+        ActivePackVersion = version;
+
+        // The pack is now on disk; sync the draft so its in-memory state matches.
+        PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+        DraftService.Save(_drafts);
 
         _blockSwap = true;
         LibraryList.SelectedItem = packRef;
@@ -212,22 +326,44 @@ public partial class PackManagerWindow : Window
 
         var (manifest, packDir) = result.Value;
 
-        ClearAllReplacements();
-        PackNameBox.Text = manifest.Name;
-        VersionBox.Text = manifest.Version;
-        ActivePackDir = packDir;
-        ActivePackName = manifest.Name;
+        // Preserve unsaved active-pack state.
+        PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+        DraftService.Save(_drafts);
 
-        var count = PackService.ApplyPackToEntries(manifest, packDir, _allEntries);
+        ClearAllReplacements();
+
+        int count;
+        string name, version;
+        if (_drafts.TryGetValue(packDir, out var draft))
+        {
+            count = PackService.ApplyDraftToEntries(draft, _allEntries);
+            name = draft.Name;
+            version = draft.Version;
+        }
+        else
+        {
+            count = PackService.ApplyPackToEntries(manifest, packDir, _allEntries);
+            name = manifest.Name;
+            version = manifest.Version;
+        }
+
+        PackNameBox.Text = name;
+        VersionBox.Text = version;
+        ActivePackDir = packDir;
+        ActivePackName = name;
+        ActivePackVersion = version;
+        PackService.SnapshotToDraft(_drafts, ActivePackDir, ActivePackName, ActivePackVersion, _allEntries);
+        DraftService.Save(_drafts);
+
         RefreshPackList();
         await LoadBitmapsAsync();
 
-        var packRef = UpsertInLibrary(manifest.Name, manifest.Version, packDir);
+        var packRef = UpsertInLibrary(name, version, packDir);
         _blockSwap = true;
         LibraryList.SelectedItem = packRef;
         _blockSwap = false;
 
-        StatusText.Text = $"Loaded '{manifest.Name}' — {count} texture(s) staged.";
+        StatusText.Text = $"Loaded '{name}' — {count} texture(s) staged.";
     }
 
     // Removes any existing library entry for packDir, adds a fresh one, persists, returns it.

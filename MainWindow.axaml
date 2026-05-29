@@ -20,18 +20,20 @@
 
     <!-- Bottom bar: status + actions -->
     <Border DockPanel.Dock="Bottom" Background="#1a1a1a" Padding="10 8">
-      <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,*,Auto,Auto">
+      <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,Auto,*,Auto,Auto">
         <Button Grid.Column="0" Content="Manage Pack"    Margin="0 0 6 0" Click="OnManagePackClick"/>
         <Button Grid.Column="1" Content="Load Pack"      Margin="0 0 6 0" Click="OnLoadPackClick"/>
         <Button Grid.Column="2" Content="Apply All"      Margin="0 0 6 0" Click="OnApplyAllClick" Classes="accent"/>
         <Button Grid.Column="3" Content="Restore Backups" Margin="0 0 6 0" Click="OnRestoreClick"/>
-        <TextBlock Grid.Column="4" x:Name="StatusText" VerticalAlignment="Center"
+        <Button Grid.Column="4" Content="Open Log" Margin="0 0 6 0" Click="OnOpenLogClick"
+                ToolTip.Tip="Reveal the session log file in the file manager"/>
+        <TextBlock Grid.Column="5" x:Name="StatusText" VerticalAlignment="Center"
                    Foreground="#aaaaaa" Margin="6 0 0 0" TextTrimming="CharacterEllipsis"
                    Cursor="Hand" PointerPressed="OnStatusClick"
                    ToolTip.Tip="Click to copy full message"/>
-        <TextBlock Grid.Column="5" x:Name="StagedCount" VerticalAlignment="Center"
+        <TextBlock Grid.Column="6" x:Name="StagedCount" VerticalAlignment="Center"
                    Foreground="#66aaff" Margin="6 0 0 0"/>
-        <TextBlock Grid.Column="6" x:Name="PackCount" VerticalAlignment="Center"
+        <TextBlock Grid.Column="7" x:Name="PackCount" VerticalAlignment="Center"
                    Foreground="#66dd88" Margin="6 0 0 0"/>
       </Grid>
     </Border>
@@ -54,12 +56,18 @@
                  SelectionChanged="OnTextureSelected">
           <ListBox.ItemTemplate>
             <DataTemplate x:DataType="models:TextureEntry">
-              <Grid ColumnDefinitions="*,Auto" Margin="0 2 0 2">
+              <Grid ColumnDefinitions="*,Auto" Margin="0 2 0 2"
+                    ToolTip.Tip="{Binding SourceTag}">
                 <StackPanel Grid.Column="0" Spacing="1">
                   <StackPanel Orientation="Horizontal" Spacing="5">
                     <Border Background="#33446688" CornerRadius="3" Padding="3 1"
                             IsVisible="{Binding IsAudio}" VerticalAlignment="Center">
                       <TextBlock Text="♪" FontSize="10" Foreground="#88aaff"/>
+                    </Border>
+                    <Border Background="#553333" CornerRadius="3" Padding="3 1"
+                            IsVisible="{Binding IsDuplicate}" VerticalAlignment="Center"
+                            ToolTip.Tip="Multiple textures share this name — see tooltip for source.">
+                      <TextBlock Text="{Binding DuplicateLabel}" FontSize="10" Foreground="#ffaaaa"/>
                     </Border>
                     <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis"
                                VerticalAlignment="Center"/>
@@ -104,9 +112,14 @@
                        IsVisible="False"/>
               </Panel>
             </Border>
-            <Button Grid.Row="2" x:Name="PlayCurrentButton" Content="▶ Play"
-                    HorizontalAlignment="Center" Margin="0 6 0 0"
-                    IsVisible="False" Click="OnPlayCurrentClick"/>
+            <StackPanel Grid.Row="2" Orientation="Horizontal"
+                        HorizontalAlignment="Center" Margin="0 6 0 0" Spacing="6">
+              <Button x:Name="PlayCurrentButton" Content="▶ Play"
+                      IsVisible="False" Click="OnPlayCurrentClick"/>
+              <Button x:Name="RestoreEntryButton" Content="Restore Original"
+                      IsVisible="False" Click="OnRestoreEntryClick"
+                      ToolTip.Tip="Revert this asset to the backed-up original. For a base sprite, its _2x is restored too."/>
+            </StackPanel>
           </Grid>
 
           <!-- Replacement texture -->
@@ -126,14 +139,22 @@
                        IsVisible="False"/>
               </Panel>
             </Border>
-            <StackPanel Grid.Row="2" Orientation="Horizontal"
-                        HorizontalAlignment="Center" Margin="0 6 0 0">
-              <Button x:Name="ImportButton" Content="Import PNG" Margin="0 0 6 0" Click="OnImportPngClick"/>
-              <Button x:Name="PlayReplacementButton" Content="▶ Play"
-                      Margin="0 0 6 0" IsVisible="False" Click="OnPlayReplacementClick"/>
-              <Button Content="Clear"         Margin="0 0 6 0" Click="OnClearReplacementClick"/>
-              <Button x:Name="AddToPackButton" Margin="0 0 0 0"
-                      Click="OnToggleInPackClick" IsVisible="False"/>
+            <StackPanel Grid.Row="2" Orientation="Vertical" HorizontalAlignment="Center" Margin="0 6 0 0">
+              <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                <Button x:Name="ImportButton" Content="Import PNG" Margin="0 0 6 0" Click="OnImportPngClick"/>
+                <Button x:Name="PlayReplacementButton" Content="▶ Play"
+                        Margin="0 0 6 0" IsVisible="False" Click="OnPlayReplacementClick"/>
+                <Button Content="Clear"         Margin="0 0 6 0" Click="OnClearReplacementClick"/>
+                <Button x:Name="AddToPackButton" Margin="0 0 0 0"
+                        Click="OnToggleInPackClick" IsVisible="False"/>
+              </StackPanel>
+              <StackPanel x:Name="BorderControls" Orientation="Horizontal"
+                          HorizontalAlignment="Center" Margin="0 6 0 0" Spacing="6"
+                          IsVisible="False">
+                <Button x:Name="BorderButton" Content="Add SAP Border" Click="OnBorderClick"/>
+                <TextBlock x:Name="BorderInfo" VerticalAlignment="Center"
+                           Foreground="#888" FontSize="11"/>
+              </StackPanel>
             </StackPanel>
           </Grid>
         </Grid>

@@ -5,6 +5,7 @@ using BCnEncoder.Decoder;
 using BCnEncoder.Shared;
 using NAudio.Vorbis;
 using NAudio.Wave;
+using NLayer.NAudioSupport;
 using SapTextureTool.Models;
 using SkiaSharp;
 using System.IO;
@@ -411,16 +412,26 @@ public static class BundleService
     {
         foreach (var group in entries.Where(e => e.HasReplacement).GroupBy(e => e.BundlePath))
         {
-            progress?.Report($"Patching {Path.GetFileName(group.Key)}...");
-            var bakPath = group.Key + ".bak";
-            if (!File.Exists(bakPath))
-                File.Copy(group.Key, bakPath);
+            try
+            {
+                Logger.Info($"Apply group start: {group.Key} ({group.Count()} entries)");
+                progress?.Report($"Patching {Path.GetFileName(group.Key)}...");
+                var bakPath = group.Key + ".bak";
+                if (!File.Exists(bakPath))
+                    File.Copy(group.Key, bakPath);
 
-            var list = group.ToList();
-            if (list[0].IsBundle)
-                PatchBundle(group.Key, list, progress);
-            else
-                PatchAssetsFile(group.Key, list, progress);
+                var list = group.ToList();
+                if (list[0].IsBundle)
+                    PatchBundle(group.Key, list, progress);
+                else
+                    PatchAssetsFile(group.Key, list, progress);
+                Logger.Info($"Apply group done: {group.Key}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Apply group failed: {group.Key}", ex);
+                throw;
+            }
         }
     }
 
@@ -567,7 +578,148 @@ public static class BundleService
         File.WriteAllBytes(catalogPath, catalog);
     }
 
-    // ── Restore backups ───────────────────────────────────────────────────────
+    // ── Per-entry restore ────────────────────────────────────────────────────
+
+    // Restores individual assets from each bundle's .bak by copying the original asset's
+    // base field (and any sprites that reference a restored texture) back into the current
+    // bundle. Leaves the .bak in place so other entries can still be restored. Does not
+    // touch the .resS appended audio data — restoring m_Resource fields points back to the
+    // original offsets inside the .resS, so leftover appended bytes are harmless dead data.
+    public static void RestoreEntries(IEnumerable<TextureEntry> entries, IProgress<string>? progress = null)
+    {
+        foreach (var group in entries.GroupBy(e => e.BundlePath))
+        {
+            var bundlePath = group.Key;
+            var bakPath = bundlePath + ".bak";
+            if (!File.Exists(bakPath))
+            {
+                Logger.Info($"RestoreEntries: no backup for {bundlePath}, skipping");
+                progress?.Report($"No backup for {Path.GetFileName(bundlePath)}");
+                continue;
+            }
+            try
+            {
+                Logger.Info($"RestoreEntries start: {bundlePath} ({group.Count()} entries)");
+                progress?.Report($"Restoring from {Path.GetFileName(bakPath)}...");
+                var list = group.ToList();
+                if (list[0].IsBundle)
+                    RestoreInBundle(bundlePath, bakPath, list, progress);
+                else
+                    RestoreInAssetsFile(bundlePath, bakPath, list, progress);
+                Logger.Info($"RestoreEntries done: {bundlePath}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"RestoreEntries failed: {bundlePath}", ex);
+                throw;
+            }
+        }
+    }
+
+    private static void RestoreInBundle(string bundlePath, string bakPath,
+        List<TextureEntry> entries, IProgress<string>? progress)
+    {
+        var amBak = CreateAssetsManager();
+        var amCur = CreateAssetsManager();
+        var tempPath = bundlePath + ".tmp";
+        try
+        {
+            var bakBun = amBak.LoadBundleFile(bakPath, true);
+            var curBun = amCur.LoadBundleFile(bundlePath, true);
+
+            foreach (var entryGroup in entries.GroupBy(e => e.BundleEntryName))
+            {
+                var bakAfile = amBak.LoadAssetsFileFromBundle(bakBun, entryGroup.Key, false);
+                var curAfile = amCur.LoadAssetsFileFromBundle(curBun, entryGroup.Key, false);
+
+                foreach (var entry in entryGroup)
+                {
+                    RestoreAssetField(amBak, bakAfile, amCur, curAfile, entry, progress);
+                }
+
+                var dirInfos = curBun.file.BlockAndDirInfo.DirectoryInfos;
+                for (var i = 0; i < dirInfos.Count; i++)
+                    if (dirInfos[i].Name == curAfile.name) { dirInfos[i].SetNewData(curAfile.file); break; }
+            }
+
+            using (var outFs = File.Open(tempPath, FileMode.Create, FileAccess.Write))
+                curBun.file.Write(new AssetsFileWriter(outFs), 0);
+        }
+        finally { amBak.UnloadAll(); amCur.UnloadAll(); }
+        File.Move(tempPath, bundlePath, overwrite: true);
+        // Catalog CRC was already zeroed during the original apply; the entry stays zeroed
+        // so Unity continues to skip CRC checking after the restore.
+        PatchCatalogCrc(bundlePath);
+    }
+
+    private static void RestoreInAssetsFile(string assetsPath, string bakPath,
+        List<TextureEntry> entries, IProgress<string>? progress)
+    {
+        var amBak = CreateAssetsManager();
+        var amCur = CreateAssetsManager();
+        var tempPath = assetsPath + ".tmp";
+        try
+        {
+            var bakAfile = amBak.LoadAssetsFile(bakPath, false);
+            amBak.LoadClassDatabaseFromPackage(bakAfile.file.Metadata.UnityVersion);
+            var curAfile = amCur.LoadAssetsFile(assetsPath, false);
+            amCur.LoadClassDatabaseFromPackage(curAfile.file.Metadata.UnityVersion);
+
+            foreach (var entry in entries)
+            {
+                RestoreAssetField(amBak, bakAfile, amCur, curAfile, entry, progress);
+            }
+
+            using (var outFs = File.Open(tempPath, FileMode.Create, FileAccess.Write))
+                curAfile.file.Write(new AssetsFileWriter(outFs), 0);
+        }
+        finally { amBak.UnloadAll(); amCur.UnloadAll(); }
+        File.Move(tempPath, assetsPath, overwrite: true);
+    }
+
+    private static void RestoreAssetField(
+        AssetsManager amBak, AssetsFileInstance bakAfile,
+        AssetsManager amCur, AssetsFileInstance curAfile,
+        TextureEntry entry, IProgress<string>? progress)
+    {
+        progress?.Report($"  Restoring {entry.Name}...");
+        var bakInfo = bakAfile.file.GetAssetInfo(entry.PathId);
+        var curInfo = curAfile.file.GetAssetInfo(entry.PathId);
+        if (bakInfo == null || curInfo == null)
+        {
+            Logger.Info($"  Asset not found for {entry.Name} (pathId {entry.PathId})");
+            return;
+        }
+        var bakBf = amBak.GetBaseField(bakAfile, bakInfo);
+        curInfo.SetNewData(bakBf);
+
+        if (entry.Kind != AssetKind.Texture) return;
+
+        // Sprites referencing this texture were rewritten as quads during apply.
+        // Walk the .bak's sprites, find any that point at this texture's PathID, and
+        // copy their original base field back over the current sprite.
+        foreach (var spriteInfo in bakAfile.file.GetAssetsOfType(AssetClassID.Sprite).ToList())
+        {
+            try
+            {
+                var sbf = amBak.GetBaseField(bakAfile, spriteInfo);
+                var rd = sbf["m_RD"];
+                if (rd.IsDummy) continue;
+                var texRef = rd["texture"];
+                if (texRef.IsDummy || texRef["m_PathID"].AsLong != entry.PathId) continue;
+
+                var curSpriteInfo = curAfile.file.GetAssetInfo(spriteInfo.PathId);
+                if (curSpriteInfo != null)
+                    curSpriteInfo.SetNewData(sbf);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"  Sprite restore failed for tex {entry.Name}", ex);
+            }
+        }
+    }
+
+    // ── Restore backups (whole-file) ──────────────────────────────────────────
 
     public static void RestoreBackups(string gameDir)
     {
@@ -776,7 +928,9 @@ public static class BundleService
             {
                 ".wav" => new WaveFileReader(ms),
                 ".ogg" => new VorbisWaveReader(ms),
-                ".mp3" => new Mp3FileReader(ms),
+                // Use NLayer (managed) instead of NAudio's default ACM decoder so MP3 decode
+                // works on macOS where Msacm32.dll doesn't exist.
+                ".mp3" => new Mp3FileReaderBase(ms, wf => new Mp3FrameDecompressor(wf)),
                 _ => throw new NotSupportedException(ext),
             };
         }
@@ -837,8 +991,9 @@ public static class BundleService
     private static bool ApplyStreamingAudioToBundle(
         AssetTypeValueField bf, BundleFileInstance bun, byte[] fileBytes, string ext)
     {
+        Logger.Info($"ApplyStreamingAudioToBundle: ext={ext} input={fileBytes.Length}B");
         var pcm = DecodeToPcm(fileBytes, ext, out int channels, out int frequency);
-        if (pcm == null) return false;
+        if (pcm == null) { Logger.Error("ApplyStreamingAudioToBundle: PCM decode returned null"); return false; }
 
         var res = bf["m_Resource"];
         if (res?.IsDummy != false) return false;
@@ -901,11 +1056,12 @@ public static class BundleService
     private static bool ApplyStreamingAudioToResS(
         AssetTypeValueField bf, byte[] fileBytes, string ext, string assetsPath)
     {
+        Logger.Info($"ApplyStreamingAudioToResS: assets={assetsPath} ext={ext} input={fileBytes.Length}B");
         var pcm = DecodeToPcm(fileBytes, ext, out int channels, out int frequency);
-        if (pcm == null) return false;
+        if (pcm == null) { Logger.Error("ApplyStreamingAudioToResS: PCM decode returned null"); return false; }
 
         var res = bf["m_Resource"];
-        if (res?.IsDummy != false) return false;
+        if (res?.IsDummy != false) { Logger.Error("ApplyStreamingAudioToResS: m_Resource is dummy"); return false; }
 
         SetAudioMetadata(bf, channels, frequency, pcm.Length);
 
@@ -925,6 +1081,7 @@ public static class BundleService
 
         var dir = Path.GetDirectoryName(assetsPath) ?? "";
         var resSPath = Path.Combine(dir, resSName);
+        Logger.Info($"  resS path: {resSPath}  origSrc='{origSrc}'  resolved name='{resSName}'");
 
         // Backup .resS alongside the .assets backup (if it exists and isn't already backed up)
         var resSBak = resSPath + ".bak";
@@ -937,16 +1094,20 @@ public static class BundleService
             wfw.Write(pcm, 0, pcm.Length);
         var wavBytes = wavMs.ToArray();
 
-        // Append WAV at the end of the .resS file (creates it if absent)
+        // Append WAV at the end of the .resS file (creates it if absent), then flush.
         long offset = File.Exists(resSPath) ? new FileInfo(resSPath).Length : 0;
         using (var fs = File.Open(resSPath, FileMode.Append, FileAccess.Write))
+        {
             fs.Write(wavBytes);
+            fs.Flush();
+        }
 
         // Point m_Resource at the new data
         if (srcField?.IsDummy == false) srcField.AsString = resSName;
         var offField = res["m_Offset"]; if (offField?.IsDummy == false) offField.AsULong = (ulong)offset;
         var szField  = res["m_Size"];   if (szField?.IsDummy  == false) szField.AsULong  = (ulong)wavBytes.Length;
 
+        Logger.Info($"  resS append OK: offset={offset} size={wavBytes.Length} (pcm {pcm.Length}B @ {channels}ch {frequency}Hz)");
         return true;
     }
 
